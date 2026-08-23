@@ -44,6 +44,7 @@ class ProjectCreateResolution:
 
 
 def _strict_project_create_enabled() -> bool:
+    """Return strict mismatch mode for direct creates and inherited fork filing."""
     return os.environ.get(_STRICT_PROJECT_CREATE_ENV, "").strip().lower() in {
         "1",
         "true",
