@@ -1380,6 +1380,9 @@ class _SessionCreateRequestBase(BaseModel):
         message event instead.
     """
 
+    # Declared here, in the legacy field position, so validation errors keep
+    # main's ordering. Concrete public models narrow the wire type below.
+    agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     title: str | None = None

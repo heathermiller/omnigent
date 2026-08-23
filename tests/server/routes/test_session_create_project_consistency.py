@@ -226,6 +226,58 @@ async def test_without_project_id_retains_legacy_agent_validation_detail(
     assert "agent_id" in SessionCreateRequest.model_json_schema()["required"]
 
 
+@pytest.mark.parametrize(
+    ("raw_body", "input_value"),
+    [("null", None), ("5", 5), ('"project_id"', "project_id")],
+)
+async def test_non_object_json_retains_exact_legacy_422(
+    project_create_client: httpx.AsyncClient,
+    raw_body: str,
+    input_value: object,
+) -> None:
+    response = await project_create_client.post(
+        "/v1/sessions",
+        content=raw_body,
+        headers={**_headers(), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {
+            "type": "model_type",
+            "loc": [],
+            "msg": "Input should be a valid dictionary or instance of SessionCreateRequest",
+            "input": input_value,
+            "url": "https://errors.pydantic.dev/2.13/v/model_type",
+        }
+    ]
+
+
+async def test_legacy_multi_error_order_starts_with_agent_id(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"agent_id": None, "labels": "not-a-dict"},
+        headers=_headers(),
+    )
+    assert response.status_code == 422
+    projected = [
+        {key: error[key] for key in ("type", "loc", "msg")} for error in response.json()["detail"]
+    ]
+    assert projected == [
+        {
+            "type": "string_type",
+            "loc": ["agent_id"],
+            "msg": "Input should be a valid string",
+        },
+        {
+            "type": "dict_type",
+            "loc": ["labels"],
+            "msg": "Input should be a valid dictionary",
+        },
+    ]
+
+
 @pytest.mark.parametrize("config_field", [("workspace", 123), ("git", "yes")])
 async def test_malformed_project_config_is_structured_400(
     project_create_client: httpx.AsyncClient,
@@ -308,6 +360,26 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
     assert session.status_code == 200, session.text
     assert session.json()["workspace"] == "/work/upload"
     assert session.json()["project_id"] == project_id
+
+
+async def test_multipart_malformed_project_config_is_structured_400(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(project_create_client, {"workspace": 123})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        data={"metadata": f'{{"project_id":"{project_id}"}}'},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="malformed-project-upload"),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 400
+    assert "Invalid project config field 'workspace'" in response.text
 
 
 async def test_shared_chokepoint_is_reusable_by_non_route_creators(

@@ -274,7 +274,9 @@ def register_core_routes(
         try:
             payload = await request.json()
             create_model = (
-                ProjectSessionCreateRequest if "project_id" in payload else SessionCreateRequest
+                ProjectSessionCreateRequest
+                if isinstance(payload, dict) and "project_id" in payload
+                else SessionCreateRequest
             )
             body = create_model.model_validate(payload)
         except json.JSONDecodeError as exc:
