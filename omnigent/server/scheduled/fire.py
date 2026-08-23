@@ -57,11 +57,12 @@ from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import SessionCreateRequest, SessionEventInput
 
 _logger = logging.getLogger(__name__)
 
@@ -392,6 +393,21 @@ async def _run_fire_for_task(
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
+        # Traverse the same project-aware create chokepoint as every HTTP create
+        # path. Scheduled tasks do not currently persist a project id, so this
+        # is deliberately a no-op today; keeping the call here prevents a future
+        # scheduled-project field from bypassing ownership/default semantics.
+        await resolve_project_session_create(
+            body=SessionCreateRequest(
+                agent_id=effective.agent_id,
+                host_id=effective.host_id,
+                workspace=effective.workspace,
+            ),
+            user_id=effective.user_id,
+            project_store=None,
+            agent_store=deps.agent_store,
+        )
+
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace

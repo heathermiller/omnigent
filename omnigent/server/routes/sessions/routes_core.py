@@ -229,7 +229,7 @@ def register_core_routes(
     )
     async def create_session(
         request: Request,
-    ) -> SessionResponse | CreatedSessionResponse:
+    ) -> SessionResponse | CreatedSessionResponse | dict[str, Any]:
         """
         Create a session.
 
@@ -252,7 +252,9 @@ def register_core_routes(
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if content_type == "multipart/form-data":
-            result = await _create_bundled_session_from_multipart(request, user_id)
+            result, project_warnings = await _create_bundled_session_from_multipart(
+                request, user_id
+            )
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(
@@ -261,6 +263,11 @@ def register_core_routes(
             # Push the new session to this user's other open tabs so it
             # enters the sidebar without a list poll (WS /sessions/updates).
             _announce_session_added(user_id, result.session_id)
+            if project_warnings:
+                return {
+                    **result.model_dump(mode="json"),
+                    "warnings": list(project_warnings),
+                }
             return result
 
         try:
@@ -286,7 +293,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp = await _create_session_from_existing_agent(
+        resp, project_warnings = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -299,6 +306,7 @@ def register_core_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
+            project_store=project_store,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -537,12 +545,17 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        if project_warnings:
+            return {
+                **resp.model_dump(mode="json"),
+                "warnings": list(project_warnings),
+            }
         return resp
 
     async def _create_bundled_session_from_multipart(
         request: Request,
         user_id: str | None,
-    ) -> CreatedSessionResponse:
+    ) -> tuple[CreatedSessionResponse, tuple[dict[str, str], ...]]:
         """
         Handle multipart ``POST /v1/sessions`` with inline agent upload.
 
@@ -579,6 +592,17 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        project_resolution = await resolve_project_session_create(
+            body=parsed_metadata,
+            user_id=user_id,
+            project_store=project_store,
+            agent_store=None,
+        )
+        parsed_metadata = project_resolution.body
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
@@ -609,7 +633,7 @@ def register_core_routes(
                 result.agent_id,
                 runner_router,
             )
-        return result
+        return result, project_resolution.warnings
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
