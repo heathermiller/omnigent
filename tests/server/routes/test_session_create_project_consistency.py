@@ -1,0 +1,240 @@
+"""Project-aware session creation defaults and consistency boundaries."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+import httpx
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+
+from omnigent.db.utils import builtin_agent_id
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
+)
+from omnigent.server.schemas import SessionCreateRequest
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.helpers import build_agent_bundle
+
+pytestmark = pytest.mark.asyncio
+
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+CUSTOM_AGENT_ID = "187b7cb7ac30abf4debfaa578d052ec6"
+OTHER_AGENT_ID = "287b7cb7ac30abf4debfaa578d052ec6"
+BUILTIN_AGENT_NAME = "generic-builtin"
+BUILTIN_AGENT_ID = builtin_agent_id(BUILTIN_AGENT_NAME)
+
+
+@pytest.fixture()
+def project_create_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(CUSTOM_AGENT_ID, "project-custom", f"{CUSTOM_AGENT_ID}/bundle")
+    agent_store.create(OTHER_AGENT_ID, "explicit-custom", f"{OTHER_AGENT_ID}/bundle")
+    agent_store.create(
+        BUILTIN_AGENT_ID,
+        BUILTIN_AGENT_NAME,
+        f"{BUILTIN_AGENT_ID}/bundle",
+    )
+    return create_app(
+        agent_store=agent_store,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def project_create_client(project_create_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=project_create_app), base_url="http://test"
+    ) as client:
+        yield client
+
+
+def _headers(user: str = ALICE) -> dict[str, str]:
+    return {"X-Forwarded-Email": user}
+
+
+async def _project(
+    client: httpx.AsyncClient, config: dict[str, object], *, user: str = ALICE
+) -> str:
+    response = await client.post(
+        "/v1/projects",
+        json={"name": f"project-{user}", "config": config},
+        headers=_headers(user),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+async def test_omitted_values_are_filled_and_membership_is_immediate(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions", json={"project_id": project_id}, headers=_headers()
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["agent_id"] == CUSTOM_AGENT_ID
+    assert body["workspace"] == "/work/project"
+    assert body["project_id"] == project_id
+
+
+async def test_explicit_values_are_not_overridden(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "agent_id": OTHER_AGENT_ID,
+            "workspace": "/work/project/subdir",
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["agent_id"] == OTHER_AGENT_ID
+    assert response.json()["workspace"] == "/work/project/subdir"
+
+
+async def test_explicit_null_is_not_defaulted(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "agent_id": None},
+        headers=_headers(),
+    )
+    assert response.status_code == 400
+    assert "agent_id is required" in response.text
+
+
+async def test_unknown_and_unowned_project_are_400(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    bob_project = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID}, user=BOB)
+    for project_id in ("0" * 32, bob_project):
+        response = await project_create_client.post(
+            "/v1/sessions",
+            json={"project_id": project_id},
+            headers=_headers(),
+        )
+        assert response.status_code == 400
+        assert "Project not found" in response.text
+
+
+async def test_workspace_mismatch_warns_and_strict_mode_escalates(
+    project_create_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
+    )
+    payload = {
+        "project_id": project_id,
+        "agent_id": CUSTOM_AGENT_ID,
+        "workspace": "/work/other",
+    }
+    response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
+    assert response.status_code == 201, response.text
+    assert response.json()["warnings"][0]["code"] == "project_workspace_mismatch"
+
+    monkeypatch.setenv("OMNIGENT_STRICT_PROJECT_SESSION_CREATE", "1")
+    response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
+    assert response.status_code == 400
+
+
+async def test_builtin_agent_mismatch_warning_surfaces(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "agent_id": BUILTIN_AGENT_ID},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["warnings"][0]["code"] == "project_agent_mismatch"
+
+
+async def test_without_project_id_response_is_unchanged(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    response = await project_create_client.post(
+        "/v1/sessions", json={"agent_id": CUSTOM_AGENT_ID}, headers=_headers()
+    )
+    assert response.status_code == 201, response.text
+    assert "warnings" not in response.json()
+
+
+async def test_multipart_create_defaults_workspace_and_files_atomically(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(project_create_client, {"workspace": "/work/upload"})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        data={"metadata": f'{{"project_id":"{project_id}"}}'},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="project-upload"),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await project_create_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.status_code == 200, session.text
+    assert session.json()["workspace"] == "/work/upload"
+    assert session.json()["project_id"] == project_id
+
+
+async def test_shared_chokepoint_is_reusable_by_non_route_creators(
+    db_uri: str,
+) -> None:
+    """Scheduled fires can pass their create body through the same resolver."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(CUSTOM_AGENT_ID, "project-custom", f"{CUSTOM_AGENT_ID}/bundle")
+    project = project_store.create(
+        "387b7cb7ac30abf4debfaa578d052ec6",
+        "scheduled",
+        ALICE,
+        {"agent_id": CUSTOM_AGENT_ID, "workspace": "/scheduled"},
+    )
+    resolved = await resolve_project_session_create(
+        body=SessionCreateRequest(project_id=project.id),
+        user_id=ALICE,
+        project_store=project_store,
+        agent_store=agent_store,
+    )
+    assert resolved.body.agent_id == CUSTOM_AGENT_ID
+    assert resolved.body.workspace == "/scheduled"

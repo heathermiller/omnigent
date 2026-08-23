@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -20,8 +23,139 @@ from omnigent.server.auth import LEVEL_READ
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
+
+_STRICT_PROJECT_CREATE_ENV = "OMNIGENT_STRICT_PROJECT_SESSION_CREATE"
+
+
+@dataclass(frozen=True)
+class ProjectCreateResolution:
+    """Project-aware request values and any non-fatal consistency warnings."""
+
+    body: Any
+    project_id: str | None = None
+    warnings: tuple[dict[str, str], ...] = ()
+
+
+def _strict_project_create_enabled() -> bool:
+    return os.environ.get(_STRICT_PROJECT_CREATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _workspace_within(candidate: str, root: str) -> bool:
+    """Return whether *candidate* is lexically inside *root*."""
+    try:
+        return PurePath(candidate).is_relative_to(PurePath(root))
+    except (TypeError, ValueError):
+        return False
+
+
+async def resolve_project_session_create(
+    *,
+    body: Any,
+    user_id: str | None,
+    project_store: ProjectStore | None,
+    agent_store: AgentStore | None = None,
+) -> ProjectCreateResolution:
+    """Apply opt-in project defaults before any create-side validation.
+
+    Field presence, rather than value, controls defaulting.  Consequently an
+    explicit JSON ``null`` remains explicit and is never replaced by a project
+    hint.  Unknown and foreign projects deliberately share one 400 response.
+    """
+    fields_set = set(body.model_fields_set)
+    project_id = getattr(body, "project_id", None)
+    if "project_id" not in fields_set or project_id is None:
+        return ProjectCreateResolution(body=body)
+    if project_store is None:
+        raise OmnigentError(
+            "Project not found",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+    if project is None:
+        raise OmnigentError("Project not found", code=ErrorCode.INVALID_INPUT)
+
+    config = project.config
+    updates: dict[str, Any] = {}
+    for field in ("agent_id", "workspace", "git"):
+        if field not in fields_set and field in config and field in body.__class__.model_fields:
+            updates[field] = config[field]
+    resolved = body.model_copy(update=updates)
+    # model_copy does not validate nested dict updates. Re-validate while
+    # restoring the original presence set plus server-filled fields.
+    resolved = body.__class__.model_validate(resolved.model_dump())
+    resolved.__pydantic_fields_set__ = fields_set | updates.keys()
+
+    if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+        raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+    if getattr(resolved, "git", None) is not None and getattr(resolved, "host_id", None) is None:
+        raise OmnigentError(
+            "git worktree creation requires host_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    warnings: list[dict[str, str]] = []
+    explicit_agent_id = getattr(body, "agent_id", None) if "agent_id" in fields_set else None
+    pinned_agent_id = config.get("agent_id")
+    if (
+        explicit_agent_id
+        and pinned_agent_id
+        and explicit_agent_id != pinned_agent_id
+        and agent_store is not None
+    ):
+        from omnigent.db.utils import builtin_agent_id
+
+        explicit_agent = await asyncio.to_thread(agent_store.get, explicit_agent_id)
+        pinned_agent = await asyncio.to_thread(agent_store.get, pinned_agent_id)
+        if (
+            explicit_agent is not None
+            and explicit_agent.id == builtin_agent_id(explicit_agent.name)
+            and pinned_agent is not None
+            and pinned_agent.id != builtin_agent_id(pinned_agent.name)
+        ):
+            warnings.append(
+                {
+                    "code": "project_agent_mismatch",
+                    "message": (
+                        "Explicit builtin agent differs from the project's custom agent hint"
+                    ),
+                }
+            )
+
+    explicit_workspace = getattr(body, "workspace", None) if "workspace" in fields_set else None
+    configured_workspace = config.get("workspace")
+    if (
+        isinstance(explicit_workspace, str)
+        and isinstance(configured_workspace, str)
+        and not _workspace_within(explicit_workspace, configured_workspace)
+    ):
+        warnings.append(
+            {
+                "code": "project_workspace_mismatch",
+                "message": "Explicit workspace is outside the project's configured workspace root",
+            }
+        )
+
+    for warning in warnings:
+        _logger.warning(
+            "project-aware session create warning project_id=%s code=%s: %s",
+            project_id,
+            warning["code"],
+            warning["message"],
+        )
+    if warnings and _strict_project_create_enabled():
+        raise OmnigentError(
+            "Project session create mismatch: " + "; ".join(w["message"] for w in warnings),
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return ProjectCreateResolution(body=resolved, project_id=project_id, warnings=tuple(warnings))
 
 
 def validate_session_model_metadata(

@@ -340,6 +340,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
@@ -7637,7 +7638,8 @@ async def _create_session_from_existing_agent(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-) -> SessionResponse:
+    project_store: ProjectStore | None = None,
+) -> tuple[SessionResponse, tuple[dict[str, str], ...]]:
     """
     Create a session bound to an already-registered agent.
 
@@ -7671,6 +7673,19 @@ async def _create_session_from_existing_agent(
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
     """
+    from omnigent.server.routes._session_create_validation import (
+        resolve_project_session_create,
+    )
+
+    project_resolution = await resolve_project_session_create(
+        body=body,
+        user_id=user_id,
+        project_store=project_store,
+        agent_store=agent_store,
+    )
+    body = project_resolution.body
+    assert body.agent_id is not None
+
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
@@ -8041,6 +8056,7 @@ async def _create_session_from_existing_agent(
             workspace=canonical_workspace,
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
+            project_id=project_resolution.project_id,
         )
     except Exception:
         # Broad catch is intentional: ANY create_conversation failure
@@ -8331,12 +8347,15 @@ async def _create_session_from_existing_agent(
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
-    return await _get_session_snapshot(
-        conversation_store,
-        conv.id,
-        agent_store=agent_store,
-        agent_cache=agent_cache,
-        liveness_lookup=liveness_lookup,
+    return (
+        await _get_session_snapshot(
+            conversation_store,
+            conv.id,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            liveness_lookup=liveness_lookup,
+        ),
+        project_resolution.warnings,
     )
 
 
