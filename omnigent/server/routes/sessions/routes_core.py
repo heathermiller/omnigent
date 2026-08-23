@@ -161,6 +161,7 @@ from omnigent.server.schemas import (
     AutomaticSessionRenameResponse,
     CreatedSessionResponse,
     PaginatedList,
+    ProjectSessionCreateRequest,
     ReadStatePutRequest,
     SessionAgentChangedEvent,
     SessionCreateRequest,
@@ -272,7 +273,10 @@ def register_core_routes(
 
         try:
             payload = await request.json()
-            body = SessionCreateRequest.model_validate(payload)
+            create_model = (
+                ProjectSessionCreateRequest if "project_id" in payload else SessionCreateRequest
+            )
+            body = create_model.model_validate(payload)
         except json.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=422,
@@ -2015,7 +2019,7 @@ def register_core_routes(
         request: Request,
         source_id: str,
         body: SessionForkRequest,
-    ) -> SessionResponse:
+    ) -> SessionResponse | dict[str, Any]:
         """
         Fork an existing session into a new session.
 
@@ -2162,15 +2166,46 @@ def register_core_routes(
             else None
         )
 
-        # Keep the fork filed in the source's first-class project, but only
-        # when the forker owns that project — projects are owner-private, so
-        # a fork of a shared session filed in someone else's project stays
-        # unfiled (a foreign project id would show in no folder view).
+        # Keep the fork filed in the source's first-class project, but route
+        # that inherited (not caller-requested) decision through the same
+        # ownership/default/warning chokepoint as a direct create. Forks do not
+        # inherit workspace or worktree settings, so explicit nulls preserve
+        # those fork semantics. A shared source's foreign project retains the
+        # historical terminal behavior: silently leave the fork unfiled.
         fork_project_id = None
-        if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
-            if owned is not None:
-                fork_project_id = source.project_id
+        fork_project_warnings: tuple[dict[str, str], ...] = ()
+        from omnigent.server.routes._session_create_validation import (
+            resolve_project_session_create,
+        )
+
+        fork_create_body = (
+            ProjectSessionCreateRequest(
+                project_id=source.project_id,
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+            if source.project_id is not None
+            else SessionCreateRequest(
+                agent_id=base_agent.id,
+                workspace=None,
+                git=None,
+            )
+        )
+
+        try:
+            fork_resolution = await resolve_project_session_create(
+                body=fork_create_body,
+                user_id=user_id,
+                project_store=project_store,
+                agent_store=agent_store,
+            )
+        except OmnigentError as exc:
+            if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
+                raise
+        else:
+            fork_project_id = fork_resolution.project_id
+            fork_project_warnings = fork_resolution.warnings
 
         try:
             new_conv = await asyncio.to_thread(
@@ -2217,7 +2252,7 @@ def register_core_routes(
             conversation_store.list_items, new_conv.id, limit=10000
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        fork_response = _build_session_response(
             new_conv,
             fork_items.data,
             "idle",
@@ -2225,6 +2260,12 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+        if fork_project_warnings:
+            return {
+                **fork_response.model_dump(mode="json"),
+                "warnings": list(fork_project_warnings),
+            }
+        return fork_response
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
 

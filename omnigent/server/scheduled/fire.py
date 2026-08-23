@@ -394,10 +394,10 @@ async def _run_fire_for_task(
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
         # Traverse the same project-aware create chokepoint as every HTTP create
-        # path. Scheduled tasks do not currently persist a project id, so this
-        # is deliberately a no-op today; keeping the call here prevents a future
-        # scheduled-project field from bypassing ownership/default semantics.
-        await resolve_project_session_create(
+        # path. Scheduled tasks do not currently persist a project id, but they
+        # consume the resolver's values so a future scheduled-project field
+        # cannot bypass ownership/default semantics.
+        create_resolution = await resolve_project_session_create(
             body=SessionCreateRequest(
                 agent_id=effective.agent_id,
                 host_id=effective.host_id,
@@ -406,6 +406,12 @@ async def _run_fire_for_task(
             user_id=effective.user_id,
             project_store=None,
             agent_store=deps.agent_store,
+        )
+        effective = replace(
+            effective,
+            agent_id=create_resolution.body.agent_id,
+            workspace=create_resolution.body.workspace,
+            host_id=create_resolution.body.host_id,
         )
 
         validate_workspace = preflight is not None and effective.workspace is not None

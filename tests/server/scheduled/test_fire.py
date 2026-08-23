@@ -306,11 +306,20 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_active_creates_session_grant_and_run() -> None:
+async def test_active_creates_session_grant_and_run(monkeypatch: pytest.MonkeyPatch) -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     launched: list[Any] = []
+    original_resolver = fire_mod.resolve_project_session_create
+    resolved_workspaces: list[str | None] = []
+
+    async def _recording_resolver(**kwargs: Any) -> Any:
+        result = await original_resolver(**kwargs)
+        resolved_workspaces.append(result.body.workspace)
+        return result
+
+    monkeypatch.setattr(fire_mod, "resolve_project_session_create", _recording_resolver)
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append((conv, task))
@@ -325,6 +334,7 @@ async def test_active_creates_session_grant_and_run() -> None:
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    assert resolved_workspaces == ["/repo"]
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
     assert perm.grants[0][2] == LEVEL_OWNER

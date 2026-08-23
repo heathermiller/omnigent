@@ -17,7 +17,11 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes._session_create_validation import (
     resolve_project_session_create,
 )
-from omnigent.server.schemas import SessionCreateRequest
+from omnigent.server.schemas import (
+    ProjectSessionCreateRequest,
+    SessionCreateRequest,
+    SessionResponse,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -134,7 +138,7 @@ async def test_explicit_null_is_not_defaulted(
     assert "agent_id is required" in response.text
 
 
-async def test_unknown_and_unowned_project_are_400(
+async def test_unknown_and_unowned_project_are_404(
     project_create_client: httpx.AsyncClient,
 ) -> None:
     bob_project = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID}, user=BOB)
@@ -144,7 +148,7 @@ async def test_unknown_and_unowned_project_are_400(
             json={"project_id": project_id},
             headers=_headers(),
         )
-        assert response.status_code == 400
+        assert response.status_code == 404
         assert "Project not found" in response.text
 
 
@@ -189,7 +193,96 @@ async def test_without_project_id_response_is_unchanged(
         "/v1/sessions", json={"agent_id": CUSTOM_AGENT_ID}, headers=_headers()
     )
     assert response.status_code == 201, response.text
-    assert "warnings" not in response.json()
+    body = response.json()
+    assert "warnings" not in body
+    # Full response round-trip pins the legacy response projection rather than
+    # checking only the fields touched by this feature.
+    assert body == SessionResponse.model_validate(body).model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, {"type": "missing", "loc": ["agent_id"], "msg": "Field required"}),
+        (
+            {"agent_id": None},
+            {
+                "type": "string_type",
+                "loc": ["agent_id"],
+                "msg": "Input should be a valid string",
+            },
+        ),
+    ],
+)
+async def test_without_project_id_retains_legacy_agent_validation_detail(
+    project_create_client: httpx.AsyncClient,
+    payload: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    response = await project_create_client.post("/v1/sessions", json=payload, headers=_headers())
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert {key: error[key] for key in ("type", "loc", "msg")} == expected
+    assert "agent_id" in SessionCreateRequest.model_json_schema()["required"]
+
+
+@pytest.mark.parametrize("config_field", [("workspace", 123), ("git", "yes")])
+async def test_malformed_project_config_is_structured_400(
+    project_create_client: httpx.AsyncClient,
+    config_field: tuple[str, object],
+) -> None:
+    field, value = config_field
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, field: value},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions", json={"project_id": project_id}, headers=_headers()
+    )
+    assert response.status_code == 400
+    assert f"Invalid project config field '{field}'" in response.text
+
+
+async def test_explicit_null_workspace_is_not_defaulted(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "workspace": "/work/project"},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "workspace": None},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["workspace"] is None
+
+
+async def test_git_default_fill_and_workspace_parent_traversal_warning(db_uri: str) -> None:
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "487b7cb7ac30abf4debfaa578d052ec6",
+        "git-defaults",
+        ALICE,
+        {
+            "agent_id": CUSTOM_AGENT_ID,
+            "workspace": "/work/project",
+            "git": {"branch_name": "feature/project"},
+        },
+    )
+    resolved = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project.id,
+            host_id="host_abc",
+            workspace="/work/project/../other",
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    assert resolved.body.git is not None
+    assert resolved.body.git.branch_name == "feature/project"
+    assert resolved.warnings[0]["code"] == "project_workspace_mismatch"
 
 
 async def test_multipart_create_defaults_workspace_and_files_atomically(
@@ -231,7 +324,7 @@ async def test_shared_chokepoint_is_reusable_by_non_route_creators(
         {"agent_id": CUSTOM_AGENT_ID, "workspace": "/scheduled"},
     )
     resolved = await resolve_project_session_create(
-        body=SessionCreateRequest(project_id=project.id),
+        body=ProjectSessionCreateRequest(project_id=project.id),
         user_id=ALICE,
         project_store=project_store,
         agent_store=agent_store,
