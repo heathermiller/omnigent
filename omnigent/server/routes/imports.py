@@ -19,6 +19,8 @@ from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
+from omnigent.server.routes._session_create_validation import resolve_project_session_create
+from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -28,6 +30,7 @@ from omnigent.session_import import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 
 class ImportItemInput(BaseModel):
@@ -116,6 +119,7 @@ def create_imports_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """Create the local-session import router."""
     router = APIRouter()
@@ -168,6 +172,19 @@ def create_imports_router(
                 code=ErrorCode.INTERNAL_ERROR,
             )
 
+        # Imports expose no project selector, but still traverse the same
+        # create chokepoint so adding one later cannot bypass its invariants.
+        # Consume the resolved values rather than treating validation as a
+        # ceremonial side call.
+        resolved_create = await resolve_project_session_create(
+            body=SessionCreateRequest(agent_id=agent_id, workspace=body.workspace),
+            user_id=user_id,
+            project_store=project_store,
+            agent_store=agent_store,
+        )
+        agent_id = resolved_create.body.agent_id
+        workspace = resolved_create.body.workspace
+
         if existing is not None:
             await conversation_store.delete_conversation(existing.id)
 
@@ -176,7 +193,7 @@ def create_imports_router(
                 conversation_store.create_conversation,
                 title=title_from_items(items),
                 agent_id=agent_id,
-                workspace=body.workspace,
+                workspace=workspace,
                 conversation_id=_import_conversation_id(body.source, body.external_session_id),
             )
         except ConversationAlreadyExistsError as exc:

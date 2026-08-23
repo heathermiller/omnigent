@@ -311,8 +311,8 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    SessionCreateInput,
     SessionCreateMetadata,
-    SessionCreateRequest,
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
@@ -7140,7 +7140,7 @@ def _ungatewayed_model_routing_error(harness: str) -> str:
 
 
 async def _reject_ungatewayed_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     agent: Agent,
@@ -7276,7 +7276,7 @@ async def _pre_session_model_catalog(
 
 
 async def _routing_host_for_create(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> Host | None:
@@ -7340,7 +7340,7 @@ def _create_resolved_harness(
 
 
 def _fixed_native_routing_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> str | None:
@@ -7379,7 +7379,7 @@ def _fixed_native_routing_harness(
 
 
 def _spec_routes_its_own_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7426,7 +7426,7 @@ def _spec_routes_its_own_harness(
 
 
 def _spawn_pins_its_harness(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     agent: Agent,
     agent_cache: AgentCache | None,
 ) -> bool:
@@ -7460,7 +7460,7 @@ def _spawn_pins_its_harness(
 
 
 async def _resolve_fixed_native_model_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
     harness: str,
@@ -7513,7 +7513,7 @@ async def _resolve_fixed_native_model_routing(
 
 
 async def _resolve_native_smart_routing(
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     user_id: str | None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
@@ -7629,7 +7629,7 @@ async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
     runner_router: RunnerRouter | None,
-    body: SessionCreateRequest,
+    body: SessionCreateInput,
     request: Request,
     agent_cache: AgentCache | None = None,
     user_id: str | None = None,

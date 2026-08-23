@@ -2224,6 +2224,7 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
         ),
         prefix="/v1",
         tags=["imports"],

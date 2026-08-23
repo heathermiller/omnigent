@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ntpath
 import os
+import posixpath
 from dataclasses import dataclass
-from pathlib import PurePath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+
+from pydantic import ValidationError
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
@@ -49,9 +53,14 @@ def _strict_project_create_enabled() -> bool:
 
 
 def _workspace_within(candidate: str, root: str) -> bool:
-    """Return whether *candidate* is lexically inside *root*."""
+    """Return whether normalized *candidate* is lexically inside *root*."""
     try:
-        return PurePath(candidate).is_relative_to(PurePath(root))
+        windows = "\\" in candidate or "\\" in root
+        path_module = ntpath if windows else posixpath
+        path_type = PureWindowsPath if windows else PurePosixPath
+        candidate_path = path_type(path_module.normpath(candidate))
+        root_path = path_type(path_module.normpath(root))
+        return candidate_path.is_relative_to(root_path)
     except (TypeError, ValueError):
         return False
 
@@ -67,31 +76,41 @@ async def resolve_project_session_create(
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
-    hint.  Unknown and foreign projects deliberately share one 400 response.
+    hint.  Unknown and foreign projects deliberately share one 404 response.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
     if "project_id" not in fields_set or project_id is None:
+        if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
+            raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
         return ProjectCreateResolution(body=body)
     if project_store is None:
         raise OmnigentError(
             "Project not found",
-            code=ErrorCode.INVALID_INPUT,
+            code=ErrorCode.NOT_FOUND,
         )
     project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
     if project is None:
-        raise OmnigentError("Project not found", code=ErrorCode.INVALID_INPUT)
+        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
 
     config = project.config
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
-    resolved = body.model_copy(update=updates)
-    # model_copy does not validate nested dict updates. Re-validate while
-    # restoring the original presence set plus server-filled fields.
-    resolved = body.__class__.model_validate(resolved.model_dump())
-    resolved.__pydantic_fields_set__ = fields_set | updates.keys()
+    resolved_data = body.model_dump()
+    resolved_data.update(updates)
+    # Re-validate project hints because config is intentionally stored as
+    # opaque JSON and may not match the session-create field types.
+    try:
+        resolved = body.__class__.model_validate(resolved_data)
+    except ValidationError as exc:
+        first = exc.errors(include_context=False)[0]
+        field = ".".join(str(part) for part in first.get("loc", ())) or "configuration"
+        raise OmnigentError(
+            f"Invalid project config field {field!r}: {first['msg']}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
 
     if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
         raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
