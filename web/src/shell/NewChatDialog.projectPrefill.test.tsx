@@ -46,7 +46,11 @@ vi.mock("@/hooks/useHosts", () => ({
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),
 }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  // Opening the agent picker prefetches details per row; no-op here.
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -132,6 +136,19 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
   return { rerender, unmount };
 }
 
+/**
+ * Open the picker and commit (select + close) an agent by clicking its row.
+ * The composed agents these tests use live under the "Custom agents"
+ * submenu, so drill in when the row isn't already listed inline.
+ */
+function selectAgent(agentId: string): void {
+  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  if (screen.queryByTestId(`new-chat-landing-agent-${agentId}`) == null) {
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+  }
+  fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+}
+
 async function submitAndReadBody(): Promise<Record<string, unknown>> {
   vi.mocked(authenticatedFetch).mockResolvedValueOnce({
     ok: true,
@@ -180,29 +197,55 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
-  it("discards a plain visit's parked draft slots so a ?project= remount seeds project defaults", async () => {
-    // Plain visit: the composer ends up holding the last-used agent and the
-    // host's recent workspace, and unmounting parks that state in the
-    // module-scoped landing draft (deliberately NOT reset here).
-    searchParams = new URLSearchParams();
-    localStorage.setItem("omnigent:last-agent-id", "ag_other");
-    const { unmount } = renderLanding();
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
-    );
-    unmount();
+  it("discards project A's parked draft slots so project B's remount seeds B's defaults", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    // Distinct stored defaults per project: Alpha pins ag_other + its repo,
+    // Beta pins ag_hello + a different repo.
+    vi.mocked(useProjectConfig).mockImplementation((id) => {
+      const data =
+        id === "proj_beta"
+          ? { host_id: "host_1", workspace: BETA_REPO, agent_id: "ag_hello" }
+          : { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
+      return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
+    });
 
-    // Project-driven remount: the draft's agent/workspace slots must yield to
-    // the project's stored defaults (the prefill writes are fill-empty-only,
-    // so a restored draft would otherwise win every slot).
+    // Visit project Alpha: its defaults seed, and unmounting parks them in
+    // the module-scoped landing draft (deliberately NOT reset here).
     searchParams = new URLSearchParams("project=Alpha");
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_hello" });
-    renderLanding();
+    const { unmount } = renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
+    unmount();
+
+    // Remount under project Beta: Alpha's drafted agent/workspace must yield
+    // to Beta's stored defaults (the prefill writes are fill-empty-only, so a
+    // restored draft would otherwise win every slot).
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
     const body = await submitAndReadBody();
     expect(body.agent_id).toBe("ag_hello");
+    expect(body.workspace).toBe(BETA_REPO);
+  });
+
+  it("keeps the draft's picked agent on a same-project remount", async () => {
+    // Same project back and forth: the draft is the user's in-progress
+    // composition for THIS project, so an explicit agent pick must survive
+    // the unmount/remount — only a project switch discards it.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_hello" });
+    const { unmount } = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    selectAgent("ag_other");
+    unmount();
+
+    renderLanding();
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_other");
     expect(body.workspace).toBe(REPO);
   });
 
@@ -258,6 +301,15 @@ describe("NewChatLandingScreen project prefill", () => {
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     expect(vi.mocked(authenticatedFetch)).not.toHaveBeenCalled();
+
+    // Recovery: an explicit pick clears the state and submit goes through
+    // with the agent the user actually chose.
+    selectAgent("ag_other");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Other"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.agent_id).toBe("ag_other");
   });
 
   it("seeds host / workspace / agent from the stored config", async () => {

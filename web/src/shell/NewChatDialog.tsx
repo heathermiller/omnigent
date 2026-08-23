@@ -2125,6 +2125,11 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          // The repo inputs compose the managed create's workspace string, so
+          // they are location state too — keeping them would clone another
+          // project's repository into this project's sandbox.
+          sandboxRepoUrl: "",
+          sandboxRepoBranch: "",
           workspace: "",
           branchName: "",
           prefilledBranch: "",
