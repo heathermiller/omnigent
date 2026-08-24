@@ -694,9 +694,13 @@ export async function describeCreateError(res: Response): Promise<string> {
  */
 export function surfaceProjectCreateWarnings(warnings: unknown): void {
   if (!Array.isArray(warnings)) return;
-  for (const warning of warnings) {
-    const message = (warning as { message?: unknown } | null)?.message;
-    if (typeof message === "string" && message !== "") showToast(message);
+  try {
+    for (const warning of warnings) {
+      const message = (warning as { message?: unknown } | null)?.message;
+      if (typeof message === "string" && message !== "") showToast(message);
+    }
+  } catch {
+    // A toast failure must never fail the create that already succeeded.
   }
 }
 
@@ -2044,6 +2048,11 @@ interface LandingDraft {
   pickedModel: string;
   pickedEffort: string;
   costControlMode: CostControlMode;
+  // Whether the agent / workspace slots still hold an untouched project-config
+  // seed (drives the create's field omission). Parked so a same-project detour
+  // neither turns an untouched seed into an "explicit" value nor the reverse.
+  agentFromConfig: boolean;
+  workspaceFromConfig: boolean;
 }
 
 let landingDraft: LandingDraft | null = null;
@@ -2386,6 +2395,13 @@ export function NewChatLandingScreen() {
     () => restoredDraft?.sandboxRepoBranch ?? "",
   );
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  // Source tracking for the create's field-omission contract: true while the
+  // slot's value is the untouched seed the project-prefill effect wrote from
+  // the config. ANY other write — a picker selection, browsing, a host
+  // switch, a generic default — flips it false, so a user re-picking even the
+  // exact config value counts as explicit and is SENT with the create.
+  const agentFromConfigRef = useRef<boolean>(restoredDraft?.agentFromConfig ?? false);
+  const workspaceFromConfigRef = useRef<boolean>(restoredDraft?.workspaceFromConfig ?? false);
   const [branchName, setBranchName] = useState<string>(() => restoredDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2529,6 +2545,8 @@ export function NewChatLandingScreen() {
     pickedModel,
     pickedEffort,
     costControlMode,
+    agentFromConfig: agentFromConfigRef.current,
+    workspaceFromConfig: workspaceFromConfigRef.current,
   };
   useEffect(() => {
     // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
@@ -2627,6 +2645,8 @@ export function NewChatLandingScreen() {
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     setWorkspace("");
     setBranchName("");
+    agentFromConfigRef.current = false;
+    workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
@@ -2809,7 +2829,10 @@ export function NewChatLandingScreen() {
     // Seed into an empty field only, so a config-supplied (or explicitly
     // picked) workspace isn't clobbered.
     const seededWorkspace = workspace === "";
-    if (seededWorkspace) setWorkspace(candidate);
+    if (seededWorkspace) {
+      workspaceFromConfigRef.current = false;
+      setWorkspace(candidate);
+    }
     // Fork fresh only when we actually seeded the redirect AND no branch is set
     // — a project that supplies its own workspace keeps a plain launch, and a
     // branch typed/picked while the probe was loading isn't overwritten (the
@@ -3429,10 +3452,21 @@ export function NewChatLandingScreen() {
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
-      if (pickedAgentId === null) setPickedHarness(readLastHarness(writes.agentId));
+      if (pickedAgentId === null) {
+        setPickedHarness(readLastHarness(writes.agentId));
+        // Config-sourced seed into an empty slot (as opposed to the last-agent
+        // fallback): the create omits the field until any other write flips this.
+        agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
+      }
     }
     if (writes.workspace !== undefined) {
-      setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
+      setWorkspace((cur) => {
+        if (cur !== "") return cur;
+        // Config-sourced seed into an empty slot (locationStep only ever
+        // writes the config workspace); idempotent under a re-run.
+        workspaceFromConfigRef.current = true;
+        return writes.workspace!;
+      });
     }
     setPrefill(step.state);
   }, [
@@ -3719,6 +3753,7 @@ export function NewChatLandingScreen() {
     setSmartRoutingDropped(null);
     const placeholder = smartRoutingWrappers.claude;
     if (placeholder == null) return;
+    agentFromConfigRef.current = false;
     setPickedAgentId(placeholder.id);
     writeLastAgentId(placeholder.id);
     setPickedHarness(AUTO_NATIVE_HARNESS_ID);
@@ -3746,10 +3781,14 @@ export function NewChatLandingScreen() {
     // NOT cleared here: it is a saved knob on the agent, and its modal's
     // always-rendered Agent Harness row is how the user switches away.
     else if (pickedHarness === AUTO_NATIVE_HARNESS_ID) handleSetPickedHarness(null, agent.id);
+    // An explicit pick — even of the value the config seeded — is the user's
+    // own choice: send it with the create rather than default-filling.
+    agentFromConfigRef.current = false;
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
   const handleSelectPending = () => {
+    agentFromConfigRef.current = false;
     setPickedAgentId(PENDING_AGENT_ID);
     setPickedHarness(null);
   };
@@ -3771,6 +3810,7 @@ export function NewChatLandingScreen() {
     // Workspace is host-specific — clear it and let the seeding effect run for
     // the new host.
     setWorkspace("");
+    workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
   }
 
@@ -3789,6 +3829,7 @@ export function NewChatLandingScreen() {
     setSandboxSelected(true);
     setSelectedHostId(null);
     setWorkspace("");
+    workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
   }
 
@@ -3917,15 +3958,20 @@ export function NewChatLandingScreen() {
       // move). A label-only folder (no first-class row yet) keeps the legacy
       // label + post-create move, which creates the project row on demand.
       const createProjectId = selectedProject !== "" ? configProjectId : null;
-      // Server-side default-fill: a value still equal to the project config
-      // that seeded it is OMITTED so the server fills it from the config; an
-      // explicit value is authoritative (the server only warns on mismatch).
+      // Server-side default-fill: a slot still holding its untouched project-
+      // config seed (per the source refs) is OMITTED so the server fills it
+      // from the config. Any user interaction — even re-picking the exact
+      // config value — cleared the ref, so an explicit choice is always SENT
+      // (the server treats it as authoritative and only warns on mismatch).
+      // The value-equality guard covers seeds later displaced without a write.
       const agentFromProjectConfig =
         createProjectId !== null &&
+        agentFromConfigRef.current &&
         prefillConfig?.agentId != null &&
         effectiveAgentId === prefillConfig.agentId;
       const workspaceFromProjectConfig =
         createProjectId !== null &&
+        workspaceFromConfigRef.current &&
         prefillConfig?.workspace != null &&
         workspaceTrimmed === prefillConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
@@ -5046,7 +5092,12 @@ export function NewChatLandingScreen() {
                         initialPath={
                           isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
                         }
-                        onNavigate={setWorkspace}
+                        onNavigate={(path) => {
+                          // Browsing is an explicit choice: the create sends
+                          // the workspace even if it matches the config seed.
+                          workspaceFromConfigRef.current = false;
+                          setWorkspace(path);
+                        }}
                         // Warn when browsing into a directory other live agents
                         // occupy. Suppressed only when a NEW isolated worktree
                         // will be created (no shared-dir conflict then). When
@@ -5178,6 +5229,7 @@ export function NewChatLandingScreen() {
                                       // though blur is about to hide the list.
                                       onMouseDown={(e) => {
                                         e.preventDefault();
+                                        workspaceFromConfigRef.current = false;
                                         setWorkspace(w.path);
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
@@ -5353,6 +5405,7 @@ export function NewChatLandingScreen() {
         onOpenChange={setCreateAgentOpen}
         onCreate={(input) => {
           setPendingAgent(input);
+          agentFromConfigRef.current = false;
           setPickedAgentId(PENDING_AGENT_ID);
           setPickedHarness(null);
         }}
