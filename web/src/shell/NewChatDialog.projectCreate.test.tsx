@@ -1,6 +1,7 @@
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -8,6 +9,9 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -68,6 +72,37 @@ vi.mock("@/hooks/useDirectorySessions", () => ({
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => new Map<string, boolean>(),
+}));
+// The file browser is heavy UI; a stub button stands in for a user browse —
+// the same onNavigate channel, deliberately re-picking the config workspace.
+vi.mock("./WorkspacePicker", () => ({
+  isNavigablePath: () => false,
+  WorkspacePicker: (props: { onNavigate: (path: string) => void }) => (
+    <button
+      type="button"
+      data-testid="test-workspace-navigate"
+      onClick={() => props.onNavigate("/Users/corey/projects/alpha")}
+    />
+  ),
+}));
+// Multipart-path plumbing: a fake bundle, a mocked multipart create + runner
+// launch, and a CreateAgentDialog stub whose button commits a pending agent.
+vi.mock("@/lib/agentBundle", () => ({
+  buildAgentBundle: vi.fn(() => Promise.resolve(new File(["x"], "bundle.tar.gz"))),
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  createBundledSession: vi.fn(),
+  launchRunner: vi.fn(),
+}));
+vi.mock("./CreateAgentDialog", () => ({
+  CreateAgentDialog: (props: { onCreate: (input: unknown) => void }) => (
+    <button
+      type="button"
+      data-testid="test-create-pending"
+      onClick={() => props.onCreate({ name: "pending-bot", instructions: "hi" })}
+    />
+  ),
 }));
 // The projects list + config drive `project_id` resolution; the move helper is
 // mocked so the tests can assert it is (not) called without HTTP plumbing.
@@ -135,10 +170,36 @@ function setRepoIsGit(): void {
   });
 }
 
-function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
+  rerender: (ui: ReactNode) => void;
+  unmount: () => void;
+} {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const info = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+    ...infoOverrides,
+  } as ServerInfo;
   function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
   }
   const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
   return { rerender, unmount };
@@ -178,6 +239,10 @@ beforeEach(() => {
   vi.mocked(moveConversationToProject).mockReset();
   vi.mocked(moveConversationToProject).mockResolvedValue({} as never);
   vi.mocked(showToast).mockReset();
+  vi.mocked(createBundledSession).mockReset();
+  vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+  vi.mocked(launchRunner).mockReset();
+  vi.mocked(launchRunner).mockResolvedValue(undefined as never);
   searchParams = new URLSearchParams("project=Alpha");
   resetLandingDraft();
   localStorage.clear();
@@ -277,6 +342,95 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("project_id" in body).toBe(false);
     expect((body.labels as Record<string, string>).omni_project).toBe("Alpha");
     expect(vi.mocked(moveConversationToProject)).toHaveBeenCalledWith("conv_new", "Alpha");
+  });
+
+  it("sends agent_id when the user explicitly re-picks the config agent", async () => {
+    // Distinguishable only with source tracking: the picked value EQUALS the
+    // config value, but the pick is the user's own — it must ride explicitly
+    // so a server-side config change can't silently substitute another agent.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Other"),
+    );
+    selectAgent("ag_other");
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.agent_id).toBe("ag_other");
+    // The workspace was never touched — still omitted.
+    expect("workspace" in body).toBe(false);
+  });
+
+  it("sends workspace when the user explicitly browses to it, even the config path", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    // Open the working-directory popover and "browse" to the config path —
+    // an explicit choice of the exact value the config seeded.
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(await screen.findByTestId("test-workspace-navigate"));
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(REPO);
+    // The agent was never touched — still omitted.
+    expect("agent_id" in body).toBe(false);
+  });
+
+  it("pins workspace and git to explicit null on a sandbox create under a project", async () => {
+    // Absent fields are default-filled from the project config, and a managed
+    // create rejects a path workspace / git block — the explicit nulls keep
+    // the server from filling them in.
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.host_type).toBe("managed");
+    expect("workspace" in body).toBe(true);
+    expect(body.workspace).toBeNull();
+    expect("git" in body).toBe(true);
+    expect(body.git).toBeNull();
+    expect("host_id" in body).toBe(false);
+    // The untouched config agent is still omitted for default-fill.
+    expect("agent_id" in body).toBe(false);
+  });
+
+  it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    vi.mocked(createBundledSession).mockResolvedValue({
+      id: "conv_new",
+      warnings: [{ code: "project_agent_mismatch", message: "bundled agent differs" }],
+    });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    // Commit a pending custom agent (via the stubbed dialog), then submit.
+    fireEvent.click(screen.getByTestId("test-create-pending"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+
+    // Atomic filing rides in the metadata part; the config-seeded workspace
+    // is omitted (server default-fill) and no born-filed label is stamped.
+    const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
+    expect(metadata).toEqual({ project_id: "proj_alpha" });
+    // The runner still launches with the explicit client-side workspace.
+    expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
+    expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
+    await waitFor(() => expect(vi.mocked(showToast)).toHaveBeenCalledWith("bundled agent differs"));
   });
 
   it("surfaces server mismatch warnings from the create response as toasts", async () => {
