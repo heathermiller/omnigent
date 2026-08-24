@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
 import {
   Command,
   CommandEmpty,
@@ -581,6 +582,19 @@ export async function describeCreateError(res: Response): Promise<string> {
     // Non-JSON body — fall through to the generic message.
   }
   return `Couldn't create the session (HTTP ${res.status}).`;
+}
+
+/**
+ * Surface a project-aware create's non-fatal consistency `warnings` (explicit
+ * value differs from the project config) as toasts. The session was created,
+ * so this must never block or fail the flow — unrecognized shapes are ignored.
+ */
+export function surfaceProjectCreateWarnings(warnings: unknown): void {
+  if (!Array.isArray(warnings)) return;
+  for (const warning of warnings) {
+    const message = (warning as { message?: unknown } | null)?.message;
+    if (typeof message === "string" && message !== "") showToast(message);
+  }
 }
 
 /**
@@ -3961,15 +3975,35 @@ export function NewChatLandingScreen() {
         agentSupportsApprovalMode && bypassSandbox
           ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
           : nativeLabels;
-      // When filing into a project, stamp its legacy `omni_project` label at
-      // create so the session is BORN FILED. The sidebar dual-reads project
-      // membership from this label OR the first-class `project_id` the follow-up
-      // move sets, so the row groups under its project from its very first
-      // sidebar appearance instead of flashing through the ungrouped "Sessions"
-      // section while the search-indexed session list catches up to the move.
-      const createLabels = selectedProject
-        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-        : baseLabels;
+      // First-class project filing: a project-driven visit whose `?project=`
+      // name resolved to a real project id sends `project_id` so the server
+      // files the session atomically at create (born filed, no follow-up
+      // move). A label-only folder (no first-class row yet) keeps the legacy
+      // label + post-create move, which creates the project row on demand.
+      const createProjectId = selectedProject !== "" ? configProjectId : null;
+      // Server-side default-fill: a value still equal to the project config
+      // that seeded it is OMITTED so the server fills it from the config; an
+      // explicit value is authoritative (the server only warns on mismatch).
+      const agentFromProjectConfig =
+        createProjectId !== null &&
+        prefillConfig?.agentId != null &&
+        effectiveAgentId === prefillConfig.agentId;
+      const workspaceFromProjectConfig =
+        createProjectId !== null &&
+        prefillConfig?.workspace != null &&
+        workspaceTrimmed === prefillConfig.workspace;
+      // When filing into a project by LABEL, stamp its legacy `omni_project`
+      // label at create so the session is BORN FILED. The sidebar dual-reads
+      // project membership from this label OR the first-class `project_id` the
+      // follow-up move sets, so the row groups under its project from its very
+      // first sidebar appearance instead of flashing through the ungrouped
+      // "Sessions" section while the search-indexed session list catches up to
+      // the move. A `project_id` create needs no label: the row is born with
+      // first-class membership (and a label would go stale on project rename).
+      const createLabels =
+        selectedProject && createProjectId === null
+          ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+          : baseLabels;
 
       let data: { id: string };
 
@@ -3981,15 +4015,24 @@ export function NewChatLandingScreen() {
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = {};
-        if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
-        // Born-filed: stamp the project's `omni_project` label so a bundled
-        // session groups under its project from its first sidebar appearance,
-        // same as the JSON path (see `createLabels`).
-        if (selectedProject) metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
-        data = await createBundledSession(
+        // A config-seeded workspace is omitted on a `project_id` create so the
+        // server default-fills it (same field semantics as the JSON path).
+        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (createProjectId !== null) {
+          // Atomic filing: the server sets first-class `project_id` at create.
+          metadata.project_id = createProjectId;
+        } else if (selectedProject) {
+          // Born-filed: stamp the project's `omni_project` label so a bundled
+          // session groups under its project from its first sidebar appearance,
+          // same as the JSON path (see `createLabels`).
+          metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
+        }
+        const bundled = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
+        surfaceProjectCreateWarnings(bundled.warnings);
+        data = { id: bundled.id };
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -4041,20 +4084,36 @@ export function NewChatLandingScreen() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            agent_id: effectiveAgentId,
+            // Config-seeded agent on a `project_id` create: omitted so the
+            // server default-fills it from the project config.
+            ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+            ...(createProjectId !== null ? { project_id: createProjectId } : {}),
             ...(sandboxSelected
               ? {
                   host_type: "managed",
-                  workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
+                  // On a `project_id` create an ABSENT workspace would be
+                  // default-filled with the config's path workspace, which a
+                  // managed create rejects — pin an explicit null instead
+                  // (explicit values are never replaced by project hints).
+                  workspace:
+                    composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ??
+                    (createProjectId !== null ? null : undefined),
+                  // Same guard for a config-stored `git` block: a sandbox has
+                  // no host for the server to create a worktree on.
+                  ...(createProjectId !== null ? { git: null } : {}),
                   // Omitted when null so a default create is unchanged.
                   ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
                 }
               : {
                   host_id: selectedHostId,
-                  workspace: workspaceTrimmed,
+                  // Config-seeded workspace on a `project_id` create: omitted
+                  // so the server default-fills it (see agent_id above).
+                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
-                  // delete flow without creating anything), or neither.
+                  // delete flow without creating anything), or neither. Always
+                  // explicit when set: the branch name is generated (or typed)
+                  // client-side, so the server cannot default-fill it.
                   git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : startInExistingWorktree
@@ -4128,7 +4187,15 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) return { error: await describeCreateError(response) };
-          return { id: ((await response.json()) as { id: string }).id };
+          const created = (await response.json()) as {
+            id: string;
+            warnings?: { code?: string; message?: string }[];
+          };
+          // Non-fatal project-consistency warnings from a `project_id` create
+          // (explicit value differs from the project config) — surfaced even
+          // when the pushed row won the navigation race below.
+          surfaceProjectCreateWarnings(created.warnings);
+          return { id: created.id };
         })();
         // Once the create answers, its id is authoritative — stop listening.
         void confirmed.finally(() => abortPush.abort()).catch(() => {});
@@ -4181,13 +4248,21 @@ export function NewChatLandingScreen() {
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
-      // Promote the born-filed session to first-class project membership. The
-      // create above already stamped the `omni_project` label (so the row
-      // groups under its project immediately); this move sets the first-class
-      // `project_id` and clears that label — the single source of truth after
-      // the dual-read transition. Non-fatal if it fails: the session stays
-      // filed by its label, so it still shows under the project either way.
-      if (selectedProject) {
+      if (createProjectId !== null) {
+        // The create filed the session atomically via first-class
+        // `project_id` — no follow-up move. Still refresh the project lists:
+        // the target folder fetches its own paginated list
+        // (useProjectSessions), separate from the global conversations list.
+        void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      } else if (selectedProject) {
+        // Promote the born-filed session to first-class project membership.
+        // The create above already stamped the `omni_project` label (so the
+        // row groups under its project immediately); this move sets the
+        // first-class `project_id` and clears that label — the single source
+        // of truth after the dual-read transition. Non-fatal if it fails: the
+        // session stays filed by its label, so it still shows under the
+        // project either way.
         try {
           // File via first-class project_id; the helper resolves the picked
           // name to a project id, creating an empty project on demand when the
