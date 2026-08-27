@@ -194,6 +194,18 @@ describe("projectPrefill agent seeding", () => {
     expect(step!.writes.agentId).toBe("ag_cfg");
   });
 
+  it("treats a blank config agent id as absent and falls back to the last-used agent", () => {
+    // An empty or whitespace-only stored id is "not configured" — seeding it
+    // verbatim would trip the composer's "agent unavailable" state for a
+    // config that names no agent at all.
+    for (const agentId of ["", "   "]) {
+      const { writes } = runToDone(
+        inputs({ agents: [{ id: "ag_hello" }], lastAgentId: "ag_hello", config: { agentId } }),
+      );
+      expect(writes.agentId).toBe("ag_hello");
+    }
+  });
+
   it("seeds no agent when neither config nor last-used is available", () => {
     const { state, writes } = runToDone(inputs({ lastAgentId: null, config: {} }));
     expect(writes.agentId).toBeUndefined();

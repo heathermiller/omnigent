@@ -345,9 +345,11 @@ export async function prefetchAvailableAgentDetails(
  * `pinnedAgentIds` (e.g. a project's configured default agent) are guaranteed
  * to survive: any pinned id the merged list lacks — dropped by the
  * newest-wins name collapse (an id swap would silently rebind the project),
- * or missed by the recency-bounded scan — is restored from the scan or
- * resolved via a direct per-agent session lookup. A pinned id with no
- * visible session at all stays absent (the consumer surfaces that state).
+ * or missed by the recency-bounded scan — is restored from the scan, from
+ * the catalog (a session-less user template can lose its bucket to a newer
+ * same-named upload), or resolved via a direct per-agent session lookup.
+ * A pinned id in neither source stays absent (the consumer surfaces that
+ * state).
  */
 async function fetchAvailableAgents(pinnedAgentIds: string[] = []): Promise<AvailableAgent[]> {
   const [catalog, scanned] = await Promise.all([
@@ -423,12 +425,15 @@ async function fetchAvailableAgents(pinnedAgentIds: string[] = []): Promise<Avai
 
   // Pinned-survival pass: restore every pinned id the merge lost (from the
   // scan when it saw the agent but a same-named newer row won its bucket),
-  // or resolve it directly when the bounded scan never saw it.
+  // from the catalog when the pin is a user-registered template with no
+  // sessions of its own, or via a direct lookup when neither source saw it.
   const missingPinned = pinnedAgentIds.filter((id) => !merged.some((a) => a.id === id));
   const restored = await Promise.all(
     missingPinned.map((id) => {
       const seen = scanned.find((s) => s.agentId === id);
-      return seen ? Promise.resolve(sessionAgentFromScan(seen)) : lookupPinnedAgent(id);
+      if (seen) return Promise.resolve(sessionAgentFromScan(seen));
+      const template = catalog.find((a) => a.id === id);
+      return template ? Promise.resolve(template) : lookupPinnedAgent(id);
     }),
   );
   merged.push(...restored.filter((a): a is AvailableAgent => a !== null));

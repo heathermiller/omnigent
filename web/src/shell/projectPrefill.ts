@@ -94,7 +94,10 @@ export function projectPrefillStep(
 
   if (!state.agentSeeded) {
     const { agents, lastAgentId, config } = inputs;
-    if (config?.agentId != null) {
+    // A blank/whitespace-only stored id is "not configured", not a real agent
+    // — fall through to the generic default instead of seeding a value the
+    // composer could only surface as "agent unavailable".
+    if (config?.agentId != null && config.agentId.trim() !== "") {
       // A configured agent seeds verbatim, without waiting for (or checking)
       // the picker list — the create API accepts session-scoped agents the
       // caller can read, so absence from the list doesn't mean unusable.
@@ -161,7 +164,10 @@ function locationStep(
   if (configHostUsable) writes.hostId = config!.hostId;
   // A configured workspace seeds the field even when the config host is
   // offline (or config names no host) — dropping the hint would let a
-  // generic recent path fill in, which can belong to another project. Only
+  // generic recent path fill in, which can belong to another project.
+  // Deliberate tradeoff: the generic default then fills selectedHostId with a
+  // DIFFERENT host, so host and workspace can diverge (a path that may not
+  // exist there) — accepted over losing the project's workspace hint. Only
   // a sandbox pick or an explicit switch to a different host suppresses it.
   // Without one, the composer's home-fallback fills the field. Any opt-in
   // worktree (config.useWorktree) is handled by a dedicated post-settle

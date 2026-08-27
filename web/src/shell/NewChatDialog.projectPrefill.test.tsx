@@ -15,6 +15,8 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
@@ -138,6 +140,38 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
   }
   const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
   return { rerender, unmount };
+}
+
+/** Same as renderLanding, but with the managed-sandbox host option enabled. */
+function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: true,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
+  }
+  const { rerender } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return { rerender };
 }
 
 /**
@@ -411,6 +445,42 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
     expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("clears a drafted sandbox repository on an in-place project switch (screen stays mounted)", async () => {
+    // Mounted mirror of the unmount/remount sandbox-leak case: clicking
+    // another project's pencil only changes `?project=` — the screen never
+    // unmounts, so the draft-restore strip can't help. The reset effect must
+    // clear the staged repo/branch or project Beta's sandbox silently clones
+    // project Alpha's repository.
+    const { rerender } = renderSandboxLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
+      "alpha-repo#alpha-main",
+    );
+
+    // Click project Beta's pencil: the param changes in place.
+    searchParams = new URLSearchParams("project=Beta");
+    rerender(<NewChatLandingScreen />);
+
+    // The sticky host pick re-selects the sandbox, but Alpha's staged repo
+    // inputs are gone.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace — not Alpha's
+    // repo#branch.
+    expect(body.workspace).toBeUndefined();
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
