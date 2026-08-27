@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.debug_logging import set_current_user_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -442,8 +443,10 @@ def _ensure_builtin_agent(
       update the row in place (keeps the ``agent_id`` stable so task
       history isn't cascade-deleted; bumps ``version`` so the runner's
       version-keyed spec cache re-fetches), then warm-swap the cache.
-    - **Row exists, content hash matches** → evict the local cache so
-      the next load re-fetches from ``bundle_location``, then return.
+    - **Row exists, content hash matches** → re-``put`` the bundle if
+      the artifact store is missing the blob (self-heals a lost
+      bundle), evict the local cache so the next load re-fetches from
+      ``bundle_location``, then return.
 
     The evict on the matching-hash path matters because
     :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
@@ -474,7 +477,13 @@ def _ensure_builtin_agent(
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
-            # Row current; evict so a lagging replica's stale cache reloads the bundle.
+            # Blob can vanish while the row survives (pruned artifacts, DB
+            # restored without the store); re-put so boot self-heals. Keyed on
+            # the row's location, not ``new_loc``: this path never rewrites the
+            # row, so a legacy ``ag_``-prefixed value is what the loader reads.
+            if not artifact_store.exists(existing.bundle_location):
+                artifact_store.put(existing.bundle_location, bundle_bytes)
+            # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
         artifact_store.put(new_loc, bundle_bytes)
@@ -1486,6 +1495,18 @@ def create_app(
         set_request_session_id_for_access_log(
             session_match.group(1) if session_match else None,
         )
+        # Bind the request's authenticated user so debug-log records emitted
+        # while handling it are attributed. Request-scoped: each request runs in
+        # its own task/context, so concurrent users never see each other's id.
+        # Best-effort — attribution must never fail a request. The raw identity
+        # (incl. the "local" single-user sentinel) is kept; it is a meaningful
+        # queryable value in the debug table.
+        try:
+            set_current_user_id(
+                auth_provider.get_user_id(request) if auth_provider is not None else None
+            )
+        except Exception:  # noqa: BLE001 — attribution is best-effort
+            set_current_user_id(None)
 
         failed = False
         status_code: int | None = None
@@ -2224,6 +2245,8 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            host_registry=host_registry,
+            host_store=host_store,
         ),
         prefix="/v1",
         tags=["imports"],
@@ -2763,6 +2786,7 @@ def create_app(
                     account_store,
                     admin_list,
                     permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
