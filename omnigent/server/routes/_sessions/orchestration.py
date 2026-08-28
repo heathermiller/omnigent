@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -616,6 +617,7 @@ async def _best_effort_stop(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
 
@@ -636,6 +638,7 @@ async def _best_effort_stop(
                 "Best-effort stop failed for %s; proceeding anyway",
                 target_id,
                 exc_info=True,
+                extra={"session_id": target_id},
             )
 
     if own_status == "running" or has_background_tasks:
@@ -687,6 +690,7 @@ async def _archive_stop(
             "Archive host-runner teardown lookup failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         return
     if conv is None or not conv.host_id or not conv.runner_id:
@@ -706,6 +710,7 @@ async def _archive_stop(
             "Archive host-runner teardown failed for %s",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         delivered = False
     if not delivered:
@@ -1163,6 +1168,32 @@ def _build_session_response(
     )
 
 
+def _sane_relay_token_count(value: object) -> int:
+    """
+    Coerce a runner-reported token count to a trusted non-negative int.
+
+    Relay usage frames are POSTed under the session owner's own bearer
+    token, so a forged negative or non-finite count must never reach the
+    additive :meth:`ConversationStore.increment_session_usage` delta: a
+    negative would claw back the session's cumulative ``total_cost_usd``
+    (the figure the relay cost-budget gate reads, since relay sessions
+    never post ``policy_cost_usd``) and a ``NaN`` / ``inf`` would poison
+    every downstream sum. Anything that is not a finite, non-negative,
+    non-bool number collapses to ``0``; the turn is then priced on
+    whatever counts survive.
+
+    :param value: Raw ``usage`` field from the harness response, e.g.
+        ``1200``, ``-1``, or ``float("nan")``.
+    :returns: The value as a non-negative ``int``, or ``0`` when it is
+        missing / the wrong type / negative / non-finite.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value < 0:
+        return 0
+    return int(value)
+
+
 def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
@@ -1205,14 +1236,19 @@ def _accumulate_session_usage(
     usage_obj = resp_obj.get("usage")
     if not isinstance(usage_obj, dict):
         return None
-    input_tokens = usage_obj.get("input_tokens", 0)
-    output_tokens = usage_obj.get("output_tokens", 0)
-    total_tokens = usage_obj.get("total_tokens", 0)
+    # Sanitize every runner-reported count: a forged negative / non-finite
+    # value here would otherwise flow into both the additive token counters
+    # and (via the catalog-pricing branch below) the additive cost delta.
+    input_tokens = _sane_relay_token_count(usage_obj.get("input_tokens", 0))
+    output_tokens = _sane_relay_token_count(usage_obj.get("output_tokens", 0))
+    total_tokens = _sane_relay_token_count(usage_obj.get("total_tokens", 0))
     if not any((input_tokens, output_tokens, total_tokens)):
         return None
 
-    cache_read_input_tokens = usage_obj.get("cache_read_input_tokens", 0)
-    cache_creation_input_tokens = usage_obj.get("cache_creation_input_tokens", 0)
+    cache_read_input_tokens = _sane_relay_token_count(usage_obj.get("cache_read_input_tokens", 0))
+    cache_creation_input_tokens = _sane_relay_token_count(
+        usage_obj.get("cache_creation_input_tokens", 0)
+    )
 
     # Load conversation metadata for pricing only (NOT for reading session_usage —
     # the atomic increment_session_usage call below handles that separately to
@@ -1248,7 +1284,11 @@ def _accumulate_session_usage(
         )
     )
     if llm_model:
-        if isinstance(provider_cost, (int, float)):
+        if (
+            isinstance(provider_cost, (int, float))
+            and math.isfinite(provider_cost)
+            and provider_cost >= 0
+        ):
             cost_delta = float(provider_cost)
             priced = True
         else:
@@ -1267,10 +1307,20 @@ def _accumulate_session_usage(
             )
             priced = pricing is not None
             if pricing is not None:
-                # Cache-aware: usage_obj carries cache_read/cache_creation
-                # token counts when the harness reports them; compute_llm_cost
-                # prices them at their own (cheaper read / pricier write) rates.
-                cost_delta = compute_llm_cost(usage_obj, pricing)
+                # Cache-aware: price the sanitized cache-read / cache-creation
+                # token counts at their own (cheaper read / pricier write)
+                # rates. Pass the validated locals, not the raw response usage
+                # — a forged negative / non-finite count must not reach the
+                # cost sum (compute_llm_cost multiplies without a lower bound).
+                cost_delta = compute_llm_cost(
+                    {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                    },
+                    pricing,
+                )
 
     # Build the delta dict and atomically apply it to the persisted
     # session_usage in a single DB transaction (SELECT FOR UPDATE on
@@ -2869,6 +2919,7 @@ async def _bind_and_launch_managed_runner(
             "terminating fresh sandbox on host %s",
             session_id,
             managed.host_id,
+            extra={"session_id": session_id},
         )
         host = await asyncio.to_thread(host_store.get_host, managed.host_id)
         if host is not None:
@@ -3110,6 +3161,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         sandbox_running,
         host_tunnel_stale,
         runner_tunnel_stale,
+        extra={"session_id": session_id},
     )
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
@@ -3363,11 +3415,13 @@ def _kick_managed_relaunch(
                 session_id,
                 MANAGED_REPO_LABEL_KEY,
                 raw_repo,
+                extra={"session_id": session_id},
             )
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,
         conv.host_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
@@ -3378,6 +3432,7 @@ def _kick_managed_relaunch(
         _logger.warning(
             "session %s: relaunch has no agent store; runner stays unclassified",
             session_id,
+            extra={"session_id": session_id},
         )
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
@@ -3460,6 +3515,7 @@ def _kick_managed_wake_impl(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
         conv.host_id,
         session_id,
+        extra={"session_id": session_id},
     )
     tracker.begin(session_id)
     # Seed the progress indicator immediately — the user is watching the
@@ -3740,6 +3796,7 @@ async def _ensure_runner_session_initialized(
             "forwarding the message anyway",
             session_id,
             exc_info=True,
+            extra={"session_id": session_id},
         )
         if require_success:
             raise OmnigentError(
@@ -5877,6 +5934,7 @@ async def _relay_runner_stream(
                     "Relay: transport lost during server shutdown for session=%s; "
                     "not failing the turn",
                     session_id,
+                    extra={"session_id": session_id},
                 )
             elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
                 # The runner went away while this session sat idle (host
@@ -7982,10 +8040,12 @@ async def _create_session_from_existing_agent(
         )
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps are all guarded by ``if ... is not None`` with no
-    # ``else``, so a name the parent's spec never declares would leave the
-    # parent spec/workdir/harness/instructions in place and boot the child
-    # as a parent clone. Fail loud here instead.
+    # spec swaps warn and keep the parent on a miss, which is right for a
+    # name that once resolved and has since been renamed or removed — but
+    # for a name the parent's spec NEVER declared it would boot the child as
+    # a parent clone for the session's whole life, off a request that was
+    # wrong when it arrived. Reject it while the caller is still here to be
+    # told, and leave the parent-fallback to the cases it fits.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,
@@ -9394,6 +9454,7 @@ async def _get_session_snapshot(
                 _logger.debug(
                     "Runner status query failed for %s",
                     session_id,
+                    extra={"session_id": session_id},
                 )
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
@@ -9436,43 +9497,38 @@ async def _get_session_snapshot(
                         agent.bundle_location,
                         expand_env=agent.session_id is None,
                     )
-                    spec = loaded.spec
+                    resolved_spec: AgentSpec | None = loaded.spec
                     if conv.sub_agent_name:
-                        child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
-                        if child_spec is not None:
-                            spec = child_spec
-                    # Prefer the spec's name over the agent row's: a
-                    # switch-created session-scoped clone is named
-                    # "<builtin> (switch ag_…)" for row disambiguation,
-                    # but clients display agent_name verbatim — the spec
-                    # carries the clean identity (e.g. "claude-native-ui").
-                    if spec.name:
-                        agent_name = spec.name
-                    llm_model = spec.executor.model
+                        _sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+                        if _sub_spec is None:
+                            # Unresolvable sub_agent_name — fall back to parent spec.
+                            _logger.warning(
+                                "Sub-agent %r for session %s did not resolve in the parent "
+                                "spec; snapshot reports the parent's identity. Likely a "
+                                "renamed/removed sub-agent or stale session metadata.",
+                                conv.sub_agent_name,
+                                session_id,
+                                extra={"session_id": session_id},
+                            )
+                        else:
+                            resolved_spec = _sub_spec
+                    if resolved_spec is not None:
+                        # Prefer the spec's name over the agent row's: a
+                        # switch-created session-scoped clone is named
+                        # "<builtin> (switch ag_…)" for row disambiguation,
+                        # but clients display agent_name verbatim — the spec
+                        # carries the clean identity (e.g. "claude-native-ui").
+                        if resolved_spec.name:
+                            agent_name = resolved_spec.name
+                        llm_model = resolved_spec.executor.model
 
-                    # Size the context ring against whatever the next turn will
-                    # actually run, using the SAME resolver the runner uses to
-                    # budget compaction. That makes the UI ring and the runner's
-                    # compaction trigger a single source of truth — computed by
-                    # one function — so they can't drift even though they run in
-                    # different processes at different times. (They previously
-                    # each inlined this rule and silently fell out of step;
-                    # sharing the function removes the manual
-                    # sync.) spec.executor.context_window describes only the spec
-                    # model, so an active override bypasses it — the resolver
-                    # makes that decision from the spec model + override.
-                    #
-                    # Offload to a worker thread: an active override (or an
-                    # undeclared window) can trigger a cache-cold provider
-                    # catalog fetch (blocking HTTP / CPU-bound litellm) inside
-                    # the resolver, which would otherwise stall the single-worker
-                    # event loop and serialize every concurrent snapshot.
-                    context_window = await asyncio.to_thread(
-                        resolve_effective_context_window,
-                        spec.executor.context_window,
-                        llm_model,
-                        model_override=conv.model_override,
-                    )
+                        # Offload: may fetch a provider catalog (blocking IO).
+                        context_window = await asyncio.to_thread(
+                            resolve_effective_context_window,
+                            resolved_spec.executor.context_window,
+                            llm_model,
+                            model_override=conv.model_override,
+                        )
         except Exception:  # noqa: BLE001
             pass
     # The harness's own report is the display authority: when a session has

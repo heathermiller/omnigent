@@ -323,6 +323,13 @@ class FamilyConfig:
         allowing self-hosted providers serving catalog-known model IDs to use
         their own rates. ``None`` (the default) means no custom pricing — falls
         back to catalog. See :class:`ModelPricingConfig`.
+    :param context_window: Optional context window size in tokens for the
+        default model (e.g. ``1048576`` for a 1M-context gateway model).
+        When set, pi-native sessions advertise this limit in ``models.json``
+        so Pi does not fall back to its own 128k default.
+    :param max_output_tokens: Optional maximum output token count for the
+        default model (e.g. ``65536``). When set, pi-native sessions
+        advertise this limit in ``models.json`` instead of Pi's 16k default.
     """
 
     base_url: str
@@ -332,6 +339,8 @@ class FamilyConfig:
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
     pricing: ModelPricingConfig | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -757,6 +766,27 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    context_window_raw = raw.get("context_window")
+    context_window: int | None = None
+    if context_window_raw is not None:
+        if not isinstance(context_window_raw, int) or context_window_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.context_window must be a positive integer, got {context_window_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        context_window = context_window_raw
+
+    max_output_tokens_raw = raw.get("max_output_tokens")
+    max_output_tokens: int | None = None
+    if max_output_tokens_raw is not None:
+        if not isinstance(max_output_tokens_raw, int) or max_output_tokens_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.max_output_tokens must be a positive integer, "
+                f"got {max_output_tokens_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_output_tokens = max_output_tokens_raw
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -765,6 +795,8 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         wire_api=wire_api,
         models=models,
         pricing=pricing,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 

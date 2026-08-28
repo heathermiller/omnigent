@@ -35,6 +35,7 @@ import {
   EyeOffIcon,
   FileDiffIcon,
   Link2Icon,
+  ListIcon,
   Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
@@ -416,11 +417,14 @@ function FileViewerBody({
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  // TOC panel state (for markdown preview)
+  const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
     setIsEditorDirty(false);
     setSaveStatus("idle");
+    setTocOpen(false);
   }, [path]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
@@ -919,6 +923,16 @@ function FileViewerBody({
       label: "Open in new tab",
       icon: <SquareArrowOutUpRightIcon className="size-4" />,
       onSelect: openHtmlInNewTab,
+    });
+  }
+  // Table of contents for markdown preview
+  if (lang === "markdown" && viewMode === "preview") {
+    toolbarActions.push({
+      key: "toc",
+      label: tocOpen ? "Hide table of contents" : "Show table of contents",
+      icon: <ListIcon className="size-4" />,
+      active: tocOpen,
+      onSelect: () => setTocOpen((prev) => !prev),
     });
   }
   // PDFs render through PdfViewer with text-layer comment anchors.
@@ -1452,6 +1466,8 @@ function FileViewerBody({
               setSearchOpen={setSearchOpen}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
+              tocOpen={tocOpen}
+              onTocToggle={() => setTocOpen((prev) => !prev)}
             />
           )}
         </div>
