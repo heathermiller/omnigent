@@ -57,13 +57,12 @@ from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import (
-    resolve_project_session_create,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.schemas import SessionCreateRequest, SessionEventInput
+from omnigent.server.schemas import SessionEventInput
 
 _logger = logging.getLogger(__name__)
 
@@ -395,27 +394,10 @@ async def _run_fire_for_task(
         # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
         # does — an agent that pins an absolute cwd outside HOME records a failed
         # run instead of silently launching outside its declared boundary.
-        # Traverse the same project-aware create chokepoint as every HTTP create
-        # path. Scheduled tasks do not currently persist a project id, but they
-        # consume the resolver's values so a future scheduled-project field
-        # cannot bypass ownership/default semantics.
-        create_resolution = await resolve_project_session_create(
-            body=SessionCreateRequest(
-                agent_id=effective.agent_id,
-                host_id=effective.host_id,
-                workspace=effective.workspace,
-            ),
-            user_id=effective.user_id,
-            project_store=None,
-            agent_store=deps.agent_store,
-        )
-        effective = replace(
-            effective,
-            agent_id=create_resolution.body.agent_id,
-            workspace=create_resolution.body.workspace,
-            host_id=create_resolution.body.host_id,
-        )
-
+        # Scheduled tasks have no project field, so there is nothing for the
+        # project-aware create resolver to do here. If tasks ever grow one,
+        # the create below must route through resolve_project_session_create
+        # so ownership/default-fill semantics match POST /v1/sessions.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
