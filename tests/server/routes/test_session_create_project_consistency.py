@@ -186,6 +186,55 @@ async def test_builtin_agent_mismatch_warning_surfaces(
     assert response.json()["warnings"][0]["code"] == "project_agent_mismatch"
 
 
+async def test_custom_agent_mismatch_warning_surfaces(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    """Any explicit agent differing from the pin warns, not just builtins."""
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "agent_id": OTHER_AGENT_ID},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["warnings"][0]["code"] == "project_agent_mismatch"
+
+
+@pytest.mark.parametrize("strict", [False, True])
+async def test_fork_of_mismatched_session_emits_no_warnings(
+    project_create_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    """Forking a session whose agent mismatches its project stays clean.
+
+    The fork never requested a project — the mismatch belongs to the source
+    session — so the fork response gains no ``warnings`` key and strict mode
+    must not reject it.
+    """
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    created = await project_create_client.post(
+        "/v1/sessions", json={"agent_id": BUILTIN_AGENT_ID}, headers=_headers()
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    moved = await project_create_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"project_id": project_id},
+        headers=_headers(),
+    )
+    assert moved.status_code == 200, moved.text
+    if strict:
+        monkeypatch.setenv("OMNIGENT_STRICT_PROJECT_SESSION_CREATE", "1")
+    fork = await project_create_client.post(
+        f"/v1/sessions/{session_id}/fork", json={}, headers=_headers()
+    )
+    assert fork.status_code == 201, fork.text
+    body = fork.json()
+    assert "warnings" not in body
+    assert body["project_id"] == project_id
+
+
 async def test_without_project_id_response_is_unchanged(
     project_create_client: httpx.AsyncClient,
 ) -> None:
@@ -224,6 +273,76 @@ async def test_without_project_id_retains_legacy_agent_validation_detail(
     error = response.json()["detail"][0]
     assert {key: error[key] for key in ("type", "loc", "msg")} == expected
     assert "agent_id" in SessionCreateRequest.model_json_schema()["required"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"project_id": None}, {"type": "missing", "loc": ["agent_id"], "msg": "Field required"}),
+        (
+            {"project_id": None, "agent_id": None},
+            {
+                "type": "string_type",
+                "loc": ["agent_id"],
+                "msg": "Input should be a valid string",
+            },
+        ),
+    ],
+)
+async def test_null_project_id_matches_key_absent_422(
+    project_create_client: httpx.AsyncClient,
+    payload: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    """A null project_id body keeps the legacy 422 contract identical.
+
+    Only the ``input`` echo may differ between the two responses: a
+    missing-field error echoes the raw request body verbatim, exactly as the
+    legacy shape did for the same body.
+    """
+    key_absent = {key: value for key, value in payload.items() if key != "project_id"}
+    absent_response = await project_create_client.post(
+        "/v1/sessions", json=key_absent, headers=_headers()
+    )
+    null_response = await project_create_client.post(
+        "/v1/sessions", json=payload, headers=_headers()
+    )
+    assert absent_response.status_code == 422
+    assert null_response.status_code == 422
+
+    def _without_input(detail: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [{key: value for key, value in error.items() if key != "input"} for error in detail]
+
+    assert _without_input(null_response.json()["detail"]) == _without_input(
+        absent_response.json()["detail"]
+    )
+    error = null_response.json()["detail"][0]
+    assert {key: error[key] for key in ("type", "loc", "msg")} == expected
+    # The missing-field echo carries the raw body, matching the legacy shape.
+    assert error["input"] == (payload if expected["type"] == "missing" else None)
+
+
+async def test_null_project_id_with_valid_agent_matches_key_absent_create(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    """A null project_id create behaves exactly like one without the key."""
+    absent_response = await project_create_client.post(
+        "/v1/sessions", json={"agent_id": CUSTOM_AGENT_ID}, headers=_headers()
+    )
+    null_response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": None, "agent_id": CUSTOM_AGENT_ID},
+        headers=_headers(),
+    )
+    assert absent_response.status_code == 201, absent_response.text
+    assert null_response.status_code == 201, null_response.text
+    body = null_response.json()
+    assert "warnings" not in body
+    assert body["project_id"] is None
+    volatile = {"id", "created_at", "updated_at", "root_conversation_id"}
+    assert {key: value for key, value in body.items() if key not in volatile} == {
+        key: value for key, value in absent_response.json().items() if key not in volatile
+    }
 
 
 @pytest.mark.parametrize(
@@ -385,10 +504,8 @@ async def test_multipart_malformed_project_config_is_structured_400(
 async def test_shared_chokepoint_is_reusable_by_non_route_creators(
     db_uri: str,
 ) -> None:
-    """Scheduled fires can pass their create body through the same resolver."""
+    """Non-route creators can pass their create body through the same resolver."""
     project_store = SqlAlchemyProjectStore(db_uri)
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    agent_store.create(CUSTOM_AGENT_ID, "project-custom", f"{CUSTOM_AGENT_ID}/bundle")
     project = project_store.create(
         "387b7cb7ac30abf4debfaa578d052ec6",
         "scheduled",
@@ -399,7 +516,69 @@ async def test_shared_chokepoint_is_reusable_by_non_route_creators(
         body=ProjectSessionCreateRequest(project_id=project.id),
         user_id=ALICE,
         project_store=project_store,
-        agent_store=agent_store,
     )
     assert resolved.body.agent_id == CUSTOM_AGENT_ID
     assert resolved.body.workspace == "/scheduled"
+
+
+def _import_payload(external_session_id: str, **extra: object) -> dict[str, object]:
+    return {
+        "source": "claude",
+        "external_session_id": external_session_id,
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            }
+        ],
+        **extra,
+    }
+
+
+def _seed_claude_import_agent(db_uri: str) -> None:
+    SqlAlchemyAgentStore(db_uri).create(
+        builtin_agent_id("claude-native-ui"),
+        name="claude-native-ui",
+        bundle_location="builtin://claude-native-ui",
+    )
+
+
+async def test_import_with_project_defaults_workspace_and_files_session(
+    project_create_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An import naming a project consumes the resolver's decisions for real."""
+    _seed_claude_import_agent(db_uri)
+    project_id = await _project(project_create_client, {"workspace": "/work/import"})
+    response = await project_create_client.post(
+        "/v1/imports",
+        json=_import_payload("project-import-1", project_id=project_id),
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await project_create_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.status_code == 200, session.text
+    assert session.json()["workspace"] == "/work/import"
+    assert session.json()["project_id"] == project_id
+
+
+async def test_import_with_unowned_or_unknown_project_is_404(
+    project_create_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _seed_claude_import_agent(db_uri)
+    bob_project = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID}, user=BOB)
+    for project_id in ("0" * 32, bob_project):
+        response = await project_create_client.post(
+            "/v1/imports",
+            json=_import_payload("project-import-denied", project_id=project_id),
+            headers=_headers(),
+        )
+        assert response.status_code == 404, response.text
+        assert "Project not found" in response.text

@@ -373,9 +373,12 @@ def register_core_routes(
 
         try:
             payload = await request.json()
+            # Dispatch on the VALUE, not key presence: a null project_id is
+            # "no project", so it must keep the legacy request shape (and its
+            # 422 contract) byte-identical to an absent key.
             create_model = (
                 ProjectSessionCreateRequest
-                if isinstance(payload, dict) and "project_id" in payload
+                if isinstance(payload, dict) and payload.get("project_id") is not None
                 else SessionCreateRequest
             )
             body = create_model.model_validate(payload)
@@ -641,7 +644,6 @@ def register_core_routes(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
-            agent_store=None,
         )
         parsed_metadata = project_resolution.body
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
@@ -2140,7 +2142,7 @@ def register_core_routes(
         request: Request,
         source_id: str,
         body: SessionForkRequest,
-    ) -> SessionResponse | dict[str, Any]:
+    ) -> SessionResponse:
         """
         Fork an existing session into a new session.
 
@@ -2289,12 +2291,14 @@ def register_core_routes(
 
         # Keep the fork filed in the source's first-class project, but route
         # that inherited (not caller-requested) decision through the same
-        # ownership/default/warning chokepoint as a direct create. Forks do not
-        # inherit workspace or worktree settings, so explicit nulls preserve
-        # those fork semantics. A shared source's foreign project retains the
-        # historical terminal behavior: silently leave the fork unfiled.
+        # ownership/default chokepoint as a direct create. The fork never asked
+        # for a project, so a source whose agent mismatches its project emits
+        # no warnings here and is never strict-rejected — the mismatch belongs
+        # to the source session, not this request. Forks do not inherit
+        # workspace or worktree settings, so explicit nulls preserve those fork
+        # semantics. A shared source's foreign project retains the historical
+        # terminal behavior: silently leave the fork unfiled.
         fork_project_id = None
-        fork_project_warnings: tuple[dict[str, str], ...] = ()
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
         )
@@ -2319,14 +2323,13 @@ def register_core_routes(
                 body=fork_create_body,
                 user_id=user_id,
                 project_store=project_store,
-                agent_store=agent_store,
+                warn_on_mismatch=False,
             )
         except OmnigentError as exc:
             if source.project_id is None or exc.code != ErrorCode.NOT_FOUND:
                 raise
         else:
             fork_project_id = fork_resolution.project_id
-            fork_project_warnings = fork_resolution.warnings
 
         try:
             new_conv = await asyncio.to_thread(
@@ -2373,7 +2376,7 @@ def register_core_routes(
             conversation_store.list_items, new_conv.id, limit=10000
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        fork_response = _build_session_response(
+        return _build_session_response(
             new_conv,
             fork_items.data,
             "idle",
@@ -2381,12 +2384,6 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
-        if fork_project_warnings:
-            return {
-                **fork_response.model_dump(mode="json"),
-                "warnings": list(fork_project_warnings),
-            }
-        return fork_response
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
 

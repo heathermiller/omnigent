@@ -71,13 +71,18 @@ async def resolve_project_session_create(
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
-    agent_store: AgentStore | None = None,
+    warn_on_mismatch: bool = True,
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
+
+    ``warn_on_mismatch=False`` skips the consistency warnings (and their
+    strict-mode escalation) for callers whose project is inherited rather than
+    requested — e.g. a fork filing into its source's project, where a mismatch
+    belongs to the source session, not this request.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -121,33 +126,19 @@ async def resolve_project_session_create(
             code=ErrorCode.INVALID_INPUT,
         )
 
+    if not warn_on_mismatch:
+        return ProjectCreateResolution(body=resolved, project_id=project_id)
+
     warnings: list[dict[str, str]] = []
     explicit_agent_id = getattr(body, "agent_id", None) if "agent_id" in fields_set else None
     pinned_agent_id = config.get("agent_id")
-    if (
-        explicit_agent_id
-        and pinned_agent_id
-        and explicit_agent_id != pinned_agent_id
-        and agent_store is not None
-    ):
-        from omnigent.db.utils import builtin_agent_id
-
-        explicit_agent = await asyncio.to_thread(agent_store.get, explicit_agent_id)
-        pinned_agent = await asyncio.to_thread(agent_store.get, pinned_agent_id)
-        if (
-            explicit_agent is not None
-            and explicit_agent.id == builtin_agent_id(explicit_agent.name)
-            and pinned_agent is not None
-            and pinned_agent.id != builtin_agent_id(pinned_agent.name)
-        ):
-            warnings.append(
-                {
-                    "code": "project_agent_mismatch",
-                    "message": (
-                        "Explicit builtin agent differs from the project's custom agent hint"
-                    ),
-                }
-            )
+    if explicit_agent_id and pinned_agent_id and explicit_agent_id != pinned_agent_id:
+        warnings.append(
+            {
+                "code": "project_agent_mismatch",
+                "message": "Explicit agent_id differs from the project's pinned agent",
+            }
+        )
 
     explicit_workspace = getattr(body, "workspace", None) if "workspace" in fields_set else None
     configured_workspace = config.get("workspace")

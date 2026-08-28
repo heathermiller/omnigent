@@ -7877,7 +7877,6 @@ async def _create_session_from_existing_agent(
         body=body,
         user_id=user_id,
         project_store=project_store,
-        agent_store=agent_store,
     )
     body = project_resolution.body
     assert body.agent_id is not None

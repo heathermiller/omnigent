@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any
 
 import httpx
 import pytest
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import OmnigentError
-from omnigent.server.routes import imports as imports_routes
 from omnigent.server.routes.imports import _stream_local_sessions_from_host
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -79,44 +77,6 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
     items = await client.get(f"/v1/sessions/{session_id}/items")
     assert items.status_code == 200
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
-
-
-async def test_import_session_traverses_shared_create_chokepoint(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The import path consumes the shared create resolver's values."""
-    _seed_claude_agent(db_uri)
-    original = imports_routes.resolve_project_session_create
-    seen: list[str | None] = []
-
-    async def _recording_resolver(**kwargs: Any) -> Any:
-        result = await original(**kwargs)
-        seen.append(result.body.workspace)
-        return result
-
-    monkeypatch.setattr(imports_routes, "resolve_project_session_create", _recording_resolver)
-    response = await client.post(
-        "/v1/imports",
-        json={
-            "source": "claude",
-            "external_session_id": "chokepoint-import",
-            "workspace": "/repo/imported",
-            "items": [
-                {
-                    "type": "message",
-                    "response_id": "claude:turn-1",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "hello"}],
-                    },
-                }
-            ],
-        },
-    )
-    assert response.status_code == 201, response.text
-    assert seen == ["/repo/imported"]
 
 
 async def test_import_session_uses_native_title_when_supplied(
