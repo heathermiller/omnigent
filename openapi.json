@@ -2216,7 +2216,7 @@
         "type": "object"
       },
       "ImportSessionRequest": {
-        "description": "Request body for importing one local harness session.",
+        "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
           "external_session_id": {
             "maxLength": 128,
@@ -2237,6 +2237,17 @@
             "minItems": 1,
             "title": "Items",
             "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "source": {
             "enum": [
