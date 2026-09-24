@@ -150,8 +150,9 @@ _STATUS_READING_PATHS: dict[str, frozenset[str]] = {
 }
 # Reads that judge a session's state. Each may only happen in an audited decider
 # above; a new one joins _STATUS_READING_PATHS and needs a behaviour test where
-# the recorded status goes stale (see tests/terminals/test_native_pane_stale_status_*.py,
-# and tests/runner/test_runner_idle_active_work.py for the runner's hold).
+# the recorded status goes stale (see tests/runner/test_native_pane_reap_conformance.py,
+# tests/terminals/test_native_pane_stale_status_*.py, and
+# tests/runner/test_runner_idle_active_work.py for the runner's hold).
 _JUDGING_READERS = frozenset({"current", "claim", "blocked"})
 
 # Dicts whose names mention "status" in the runner, reaper and native code are
@@ -757,3 +758,40 @@ def test_no_module_keeps_a_status_copy_the_lint_rule_rejects() -> None:
         )
     ]
     assert offenders == [], status_lint.HINT
+
+
+def test_the_lint_hint_points_at_the_contract_in_agents_md() -> None:
+    agents = (_PACKAGE_ROOT.parent / "AGENTS.md").read_text(encoding="utf-8")
+    assert "## Session status and liveness" in agents
+    assert status_lint.RULE_NAME in agents
+    assert "'Session status and liveness'" in status_lint.HINT
+
+
+def test_the_contract_names_the_runner_hold_as_its_one_exception() -> None:
+    # The runner idle watchdog's native-turn hold trusts a recorded status, so
+    # AGENTS.md, the lint hint and the book's contract each name it, and its
+    # bound, as the one sanctioned exception to "a claim, never a veto".
+    agents = (_PACKAGE_ROOT.parent / "AGENTS.md").read_text(encoding="utf-8")
+    contract = SessionStatusBook.__doc__ or ""
+    for text in (agents, status_lint.HINT, contract):
+        normalized = " ".join(text.split())
+        assert "one sanctioned claim-based hold" in normalized
+        assert "OMNIGENT_NATIVE_PANE_MAX_TURN_S" in normalized
+        assert "same rule" not in normalized
+    assert "_native_turn_in_flight" in agents and "_native_turn_in_flight" in contract
+    assert "_native_turn_in_flight" in _STATUS_READING_PATHS
+
+
+def test_the_contract_bounds_each_kind_of_runner_hold() -> None:
+    # A reported dialog or an open prompt park holds the runner for up to the
+    # approval bound from when it opened, whatever the claim ceiling is; only a
+    # recorded running/waiting ends at the claim ceiling after its last
+    # evidence of work. Each contract text names both bounds.
+    agents = (_PACKAGE_ROOT.parent / "AGENTS.md").read_text(encoding="utf-8")
+    contract = SessionStatusBook.__doc__ or ""
+    for text in (agents, status_lint.HINT, contract):
+        normalized = " ".join(text.split())
+        assert "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S" in normalized
+        assert "blocked_on" in normalized
+        assert "prompt park" in normalized
+        assert "from when it opened" in normalized

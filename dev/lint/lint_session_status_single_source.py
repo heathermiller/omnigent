@@ -420,14 +420,16 @@ HINT = (
     "StatusSource; read it only through the book's reader API. A recorded `running` is a "
     "claim that can stay stale forever, so a busy/keep-alive decision must also have "
     "first-hand evidence (a live turn, pane output, a harness probe, a pending prompt). "
-    "The runner idle watchdog's native-turn hold is the one exception: a recorded "
-    "running/waiting holds it until a ceiling after the last evidence of work, and a "
-    "reported dialog (blocked_on) or an open prompt park until "
-    "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S after it opened. "
+    "The one sanctioned claim-based hold is the runner idle watchdog's native-turn hold: "
+    "a recorded running/waiting holds it for up to OMNIGENT_NATIVE_PANE_MAX_TURN_S "
+    "(floored at an hour) after the last first-hand evidence of work (agent pane output, "
+    "a runner dispatch, a new episode), a reported dialog (blocked_on) or an open prompt "
+    "park for up to OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S from when it opened, and a reap's "
+    "reset or a refutation ends it sooner; do not add another. "
     "If the container does not hold session status (a lock map, the runner's own turn "
     "tasks, the reaper's clock), exempt it with "
     "`# custom-lint: disable=session-status-single-source -- <what it holds>` on its line "
-    "(or `disable-next` on the line above)."
+    "(or `disable-next` on the line above). See AGENTS.md 'Session status and liveness'."
 )
 
 

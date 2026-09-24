@@ -776,7 +776,7 @@ def test_reaper_requires_an_assessment() -> None:
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("", "shadow"), ("veto", "veto"), ("SHADOW", "shadow"), ("bogus", "shadow")],
+    [("", "evidence"), ("veto", "veto"), ("SHADOW", "shadow"), ("bogus", "evidence")],
 )
 def test_claim_policy_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: str) -> None:
     from omnigent.terminals.pane_reaper import resolve_claim_policy

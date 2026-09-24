@@ -135,12 +135,16 @@ class SessionStatusBook:
     * A refutation (:meth:`refute`) lands only on the episode it judged, and
       only if no local channel re-asserted it while the judgement was made.
     * :meth:`current` is the last edge from any channel. It is not liveness:
-      only the pane reaper's assessment decides what a ``running`` means. The
-      one exception is the runner idle watchdog's native-turn hold: a recorded
-      ``running`` or ``waiting`` holds it until a ceiling after the last
-      first-hand evidence of work, and a reported dialog (``blocked_on``) or an
-      open prompt park until ``OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`` after it
-      opened.
+      the pane reaper's assessment decides what a ``running`` means for a
+      pane. The one sanctioned claim-based hold is the runner idle watchdog's
+      native-turn hold (``_native_turn_in_flight`` in ``runner/app.py``). A
+      recorded ``running`` or ``waiting`` holds it for up to
+      ``OMNIGENT_NATIVE_PANE_MAX_TURN_S`` (floored at an hour) after the last
+      first-hand evidence of work: a new episode, the agent pane's output or
+      a runner dispatch, never a re-assert. A reported dialog
+      (``blocked_on``) or an open prompt park holds it for up to
+      ``OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`` from when it opened. A reap's
+      :meth:`reset` ends it sooner, and so does a :meth:`refute` of a claim.
     * What the server has heard (the wire dedup baseline) is deliberately not
       stored here.
 
