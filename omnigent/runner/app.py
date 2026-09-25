@@ -14228,8 +14228,9 @@ def create_runner_app(
             """Every liveness signal for one pane (see ``pane_reaper``).
 
             Status is read only through the book's reader API. A recorded
-            ``running`` is a hard reason under the ``veto`` and ``shadow`` (the
-            default) policies, and aged evidence under ``evidence``.
+            ``running`` becomes a hard reason only under the ``veto``/``shadow``
+            rollback policies; otherwise it is aged evidence, so a claim no
+            channel ever ends cannot keep a finished pane forever.
             """
             conv_id = pane.conversation_id
             facts: dict[str, object] = {"harness": pane.terminal_name}

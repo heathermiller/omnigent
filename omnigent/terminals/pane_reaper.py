@@ -315,15 +315,19 @@ def resolve_max_turn_s() -> float:
 
 
 def resolve_claim_policy() -> ClaimPolicy:
-    """Resolve :envvar:`OMNIGENT_NATIVE_PANE_CLAIM_POLICY` (default ``shadow``)."""
+    """Resolve :envvar:`OMNIGENT_NATIVE_PANE_CLAIM_POLICY` (default ``evidence``).
+
+    ``veto`` and ``shadow`` exist only as an operator rollback; they are
+    expected to be removed in 0.17.0.
+    """
     raw = (os.environ.get(_CLAIM_POLICY_ENV) or "").strip().lower()
     if not raw:
-        return ClaimPolicy.SHADOW
+        return ClaimPolicy.EVIDENCE
     try:
         return ClaimPolicy(raw)
     except ValueError:
-        _logger.warning("%s=%r is not a claim policy; using shadow", _CLAIM_POLICY_ENV, raw)
-        return ClaimPolicy.SHADOW
+        _logger.warning("%s=%r is not a claim policy; using evidence", _CLAIM_POLICY_ENV, raw)
+        return ClaimPolicy.EVIDENCE
 
 
 def resolve_server_check_enabled() -> bool:
@@ -357,6 +361,15 @@ def _pane_event(
 
 class NativePaneReaper:
     """Background task that reaps idle, unattended native terminal panes.
+
+    Contract: a pane is kept by a hard :class:`SpareReason` or by recent
+    evidence of work. Under the default ``evidence`` policy a recorded
+    ``running`` is a claim that ages like pane output and is confirmed or
+    refuted before teardown; it never keeps a pane on its own. The reaper reads
+    no status store itself, only the assessment it is given. This prevents the
+    failure where a stale ``running`` in a cache of the runner's own publishes
+    vetoed every reap, so finished codex and antigravity panes were never
+    reaped.
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
