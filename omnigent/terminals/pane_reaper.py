@@ -433,6 +433,7 @@ class NativePaneReaper:
         # Every map below is keyed by ``PaneRef.clock_key``.
         # Monotonic time last observed busy (or, for an idle pane, the time of
         # its last evidence of work).
+        # custom-lint: disable-next=session-status-single-source -- the reaper's own idle clock
         self._last_busy_at: dict[str, float] = {}
         # {reason: monotonic time it started holding}.
         self._reason_since: dict[str, dict[SpareReason, float]] = {}

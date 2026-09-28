@@ -425,6 +425,7 @@ class SessionResourceRegistry:
         # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
         # poller keeps its own edge/mtime baselines on the watcher thread, and
         # clearing the registry's baseline alone would leave those intact.
+        # custom-lint: disable-next=session-status-single-source -- poller objects, not statuses
         self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
@@ -643,12 +644,14 @@ class SessionResourceRegistry:
         with self._lock:
             if self._server_delivery_baseline.get(session_id) == (status, blocked_on):
                 return False
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
             self._server_delivery_baseline[session_id] = (status, blocked_on)
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
+            # custom-lint: disable-next=session-status-single-source -- what the server heard
             self._server_delivery_baseline[session_id] = (status, None)
 
     def resync_session_statuses(self) -> None:

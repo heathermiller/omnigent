@@ -89,6 +89,8 @@ in `AGENTS.md` under "Session status and liveness".
 - For a new cached value, ask which channels write it: runner events, server
   relays, watchers or pollers, interrupts, reconnects, teardown. A channel that
   never writes it leaves the value stale.
+- Flag a new `# custom-lint: disable=session-status-single-source` whose reason
+  does not say what the container holds.
 - A new native harness must declare `pane_reap` and `status_owner` and pass
   `tests/runner/test_native_pane_reap_conformance.py` without new
   `_KNOWN_GAPS` entries.

@@ -3185,6 +3185,7 @@ def create_runner_app(
             locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
 
+    # custom-lint: disable-next=session-status-single-source -- this runner's own turn tasks
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     # Conversations whose claude-sdk `/compact` published an up-front

@@ -116,10 +116,11 @@ class SessionStatusBook:
 
     Contract:
 
-    * It is the only copy. Callers record through the book's recorders and
+    * It is the only copy. Callers record through the audited recorders and
       read through the reader methods; nothing keeps its own status map, since
       a copy that misses one channel stays stale on ``running`` and pins
-      whatever trusts it.
+      whatever trusts it. The ``session-status-single-source`` custom-lint rule
+      and ``tests/runner/test_session_status_single_recorder.py`` enforce this.
     * R0 — record at observation time, never again on a publish hop. The
       registry's publisher runs on the event loop after the watcher thread
       already recorded the edge; re-recording there could put a queued

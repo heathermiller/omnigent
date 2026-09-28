@@ -168,7 +168,8 @@ All are `debug_event` records with `session_id`.
 
 ```sh
 uv run --no-sync pytest -q tests/terminals tests/runner/test_native_pane_*.py \
-  tests/runner/test_session_status_book.py
+  tests/runner/test_session_status_book.py tests/runner/test_session_status_single_recorder.py \
+  tests/dev/lint/test_lint_session_status_single_source.py
 ```
 
 Changing how status is recorded or read? Follow "Session status and liveness"

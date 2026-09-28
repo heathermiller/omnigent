@@ -99,7 +99,7 @@ relayed edges, and the pane reaper trusted its stale `running`, so finished
 panes were never reaped.
 
 - **One source of truth.** Every status edge is recorded in `SessionStatusBook`
-  (`omnigent/runner/session_status.py`) through one of its recorders.
+  (`omnigent/runner/session_status.py`) through one of its audited recorders.
   A new channel gets a new `StatusSource`; it does not get its own dict.
 - **Caches are derived and owned by the recorder.** Any view of status is
   updated by the call that records the edge and cleared by the book's
@@ -127,8 +127,10 @@ panes were never reaped.
   then runs the harness through every scenario and must pass without new
   `_KNOWN_GAPS`.
 
-Code review enforces the first rule above: record through the book, and do
-not add another copy of status. See `docs/native-pane-reaping.md`.
+The `session-status-single-source` custom-lint rule and
+`tests/runner/test_session_status_single_recorder.py` enforce this. Record
+through the book instead of suppressing them; a `# custom-lint: disable=`
+must say what the container holds. See `docs/native-pane-reaping.md`.
 
 ## Framework-owned instructions
 
