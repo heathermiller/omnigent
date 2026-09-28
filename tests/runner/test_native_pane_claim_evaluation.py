@@ -23,12 +23,6 @@ from omnigent.terminals.pane_reaper import SpareReason
 from tests.terminals.native_pane_rig import FakeServerClient, PaneRig, build_pane_rig
 
 
-# These cases judge a claim as evidence; the shadow and veto cases set their own policy.
-@pytest.fixture(autouse=True)
-def _evidence_claim_policy(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_NATIVE_PANE_CLAIM_POLICY", "evidence")
-
-
 class _Clock:
     def __init__(self) -> None:
         self.now = 10_000.0
