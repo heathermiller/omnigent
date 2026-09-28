@@ -190,6 +190,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.pane_reaper import (
+    SpareReason,
+    resolve_approval_max_s,
+)
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
@@ -3133,6 +3137,23 @@ def create_runner_app(
     # still held a sub-agent result (typically: the server was down when the
     # child finished). The catch-up scan re-attempts these on tunnel reconnect.
     _stranded_wake_parents: set[str] = set()
+
+    def _has_running_children(conv_id: str) -> bool:
+        """Whether any sub-agent of *conv_id* is still launching or working."""
+        return any(
+            (entry := _subagent_work_by_child.get(child)) is not None
+            and entry.status in ("launching", "running", "waiting")
+            for child in _subagent_work_by_parent.get(conv_id, set())
+        )
+
+    def _has_live_children(conv_id: str) -> bool:
+        """Running sub-agents, or a finished child's wake still owed to *conv_id*."""
+        return (
+            _has_running_children(conv_id)
+            or conv_id in _subagent_wake_pending
+            or conv_id in _stranded_wake_parents
+        )
+
     # Single-flight holder for the paced stranded-wake retry loop, so
     # back-to-back reconnects don't stack concurrent retry loops.
     _stranded_wake_retry_task: list[asyncio.Task[None]] = []
@@ -7760,13 +7781,9 @@ def create_runner_app(
                 _start_sign_in_watch(conv_id)
         else:
             if not has_buffered and not _suppress_status:
-                children = _subagent_work_by_parent.get(conv_id, set())
-                has_running_children = any(
-                    (e := _subagent_work_by_child.get(c)) is not None
-                    and e.status in ("launching", "running", "waiting")
-                    for c in children
+                _publish_turn_status(
+                    conv_id, "waiting" if _has_running_children(conv_id) else "idle"
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
         if was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -8450,6 +8467,46 @@ def create_runner_app(
             return
         del _session_comment_relays[session_id]
         relay.close()
+
+    def _native_session_hold_reasons(
+        conv_id: str,
+        facts: dict[str, object],
+        *,
+        approval_max_s: float,
+    ) -> set[SpareReason]:
+        """Live work or a human wait holding *conv_id*'s native pane.
+
+        Synchronous and free of tmux I/O.
+
+        :param facts: Diagnostics the checks add to, e.g. ``park_age_s``.
+        :param approval_max_s: Oldest human-wait signal still honored.
+        """
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.native import prompt_parks
+
+        reasons: set[SpareReason] = set()
+        if conv_id in _active_turns or (
+            process_manager is not None and process_manager.has_active_turn(conv_id)
+        ):
+            reasons.add(SpareReason.RUNNER_TURN)
+        if mcp_execution_registry.has_live_operation(conv_id):
+            reasons.add(SpareReason.TOOL_CALL)
+        # A pane parked on a prompt emits nothing and reports no turn, so
+        # every other signal reads idle while a human can still answer.
+        if pending_approvals.has_pending(conv_id):
+            reasons.add(SpareReason.AWAITING_HUMAN)
+            facts["pending_approval"] = True
+        park_age = prompt_parks.oldest_open_age_s(conv_id)
+        if park_age is not None:
+            facts["park_age_s"] = park_age
+            if park_age < approval_max_s:
+                reasons.add(SpareReason.AWAITING_HUMAN)
+        if approval_wait_is_fresh(conv_id):
+            reasons.add(SpareReason.AWAITING_HUMAN)
+            facts["approval_marker"] = True
+        if _has_live_children(conv_id):
+            reasons.add(SpareReason.CHILDREN)
+        return reasons
 
     async def _ensure_comment_relay_started(
         session_id: str,
@@ -13477,7 +13534,6 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
@@ -13488,6 +13544,8 @@ def create_runner_app(
             NativePaneReaper,
             PaneRef,
         )
+
+        _pane_approval_max_s = resolve_approval_max_s()
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -13501,16 +13559,9 @@ def create_runner_app(
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
-            if conv_id in _active_turns or (
-                process_manager is not None and process_manager.has_active_turn(conv_id)
-            ):
+            if _native_session_hold_reasons(conv_id, {}, approval_max_s=_pane_approval_max_s):
                 return True
             if _native_pane_status.get(conv_id) == "running":
-                return True
-            # A pane parked on a permission prompt emits nothing and reports no
-            # active turn, so every signal above reads idle. Reaping it kills the
-            # prompt and strands its approval card unanswerable.
-            if approval_wait_is_fresh(conv_id):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a
