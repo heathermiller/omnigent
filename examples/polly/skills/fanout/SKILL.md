@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. polly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR and merge only when the user has authorized it.
 ---
 
 # fanout — safe parallel execution
@@ -38,9 +38,12 @@ dependency).
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's PR through `cross-review`.
-5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
-   the task is done: mark it ready in the registry with its PR URL and leave it
-   for the human to review and merge. Never run `git merge` / `gh pr merge`.
+5. When cross-review passes and all required repository checks pass, mark the
+   PR ready in the registry with its URL. Merge through the repository's normal
+   controls only if the user has authorized merging. The authorization may be
+   a standing instruction for the session; once given, do not ask again for
+   each PR. Never approve your own PR, bypass required checks or branch
+   protections, force-merge, or force-push.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
    and review is clean — the branch lives on the remote, so the worktree is
    disposable. Don't remove a worktree that still has open fix-tasks.
@@ -57,6 +60,6 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
-- Because polly never merges, cross-PR conflicts surface when the human merges,
-  not here. Keeping each parallel task's file scope disjoint is what keeps that
-  rare — honor it.
+- Cross-PR conflicts surface when PRs are merged, not during fan-out. Keep each
+  parallel task's file scope disjoint where possible. Serialize overlapping
+  tasks instead.
