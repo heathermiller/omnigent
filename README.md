@@ -348,7 +348,12 @@ omnigent run examples/debby/ --harness <harness>
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents
 (Claude Code, Codex, or Pi) in parallel git worktrees, then routes each diff
-to a reviewer from a different vendor than the one that wrote it. You merge.
+to a reviewer from a different vendor than the one that wrote it. After the
+review and required checks pass, Polly may merge through normal repository
+controls when you have authorized merging. A standing authorization applies
+for the session, so Polly does not ask again for every PR. Polly never approves
+her own PR, bypasses required checks or branch protections, force-merges, or
+force-pushes.
 
 **🟠🔵 Debby** is a brainstorming partner with two heads, one Claude and one GPT.
 Every question you ask goes to both heads, and she lays the two answers out

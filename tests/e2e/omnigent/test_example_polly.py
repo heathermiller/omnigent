@@ -334,9 +334,15 @@ def test_orchestrator_delegates_substantive_work() -> None:
     ) in compact
     # ...and polly's own sys_os_* tools may not be used to write code.
     assert (
-        "Never use them to write or edit source code or tests, run a deep code "
-        "investigation for your own answer, or merge a PR"
+        "Never use them to write or edit source code or tests, or run a deep code "
+        "investigation for your own answer"
     ) in compact
+    # Merging requires user authorization, review, and repository controls.
+    assert "only if the user has authorized merging" in compact
+    assert "A standing merge authorization remains valid for the session" in compact
+    assert "Never approve your own PR" in compact
+    assert "bypass required checks or branch protections" in compact
+    assert "force-merge, or force-push" in compact
 
 
 def test_investigation_skill_delegates_read_only_work() -> None:
